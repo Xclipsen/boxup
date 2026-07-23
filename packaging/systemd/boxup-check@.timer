@@ -1,0 +1,11 @@
+[Unit]
+Description=Run monthly Boxup metadata check for %i
+
+[Timer]
+OnCalendar=*-*-01 08:00:00 UTC
+RandomizedDelaySec=2h
+Persistent=true
+Unit=boxup-check@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+{
+  "archive": {
+    "id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "name": "test-20260722T040000Z-1",
+    "start": "2026-07-22T04:00:00.123456",
+    "end": "2026-07-22T04:01:00.654321",
+    "hostname": "test",
+    "username": "root"
+  }
+}

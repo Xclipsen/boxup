@@ -1,0 +1,64 @@
+version = 1
+
+[host]
+id = "desktop"
+
+[repository]
+location = "ssh://backup-user@backup.example:22/./boxup/desktop/repository"
+passphrase_file = "/etc/boxup/desktop.passphrase"
+ssh_key = "/etc/boxup/desktop_ed25519"
+maintenance_ssh_key = "/etc/boxup/desktop_maintenance_ed25519"
+known_hosts = "/etc/boxup/known_hosts"
+ssh_port = 22
+borg_path = "/usr/bin/borg"
+remote_path = "borg-1.4"
+lock_wait_seconds = 30
+
+[backup]
+sources = ["/boot", "/etc", "/home", "/opt", "/root", "/srv", "/usr/local", "/var/backups", "/var/lib", "/var/spool"]
+excludes = [
+  "sh:**/.cache",
+  "sh:**/node_modules",
+  "sh:**/target",
+  "pp:var/lib/docker/overlay2",
+  "pp:var/lib/docker/image",
+  "pp:var/lib/docker/buildkit",
+  "sh:var/lib/docker/containers/*/*-json.log",
+  "sh:var/lib/docker/containers/*/local-logs/*",
+]
+one_file_system = true
+exclude_caches = true
+compression = "zstd,3"
+upload_rate_kib = 8192
+state_dir = "/var/lib/boxup/desktop"
+cache_dir = "/var/cache/boxup/desktop"
+
+[retention]
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 12
+require_backup_within_hours = 48
+
+[restore]
+staging_dir = "/var/lib/boxup-restore/desktop"
+denied_paths = ["/etc/boxup"]
+max_files = 100000
+max_bytes = 107374182400
+
+[index]
+path = "/var/lib/boxup-index/desktop/index.sqlite3"
+
+[schedule]
+mode = "due"
+due_hours = 20
+
+[notifications]
+enabled = false
+
+[docker]
+enabled = false
+stop_containers = []
+stop_all_stateful = false
+min_free_bytes = 10737418240
+docker_path = "/usr/bin/docker"
+rsync_path = "/usr/bin/rsync"

@@ -1,0 +1,55 @@
+# Maintainer: Xclipsen <101043764+Xclipsen@users.noreply.github.com>
+pkgname=boxup
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Policy-focused Borg 1.4 backup frontend'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+url='https://github.com/Xclipsen/boxup'
+depends=('acl' 'borg>=1.4' 'curl' 'fuse3' 'openssh' 'polkit' 'python' 'python-pyfuse3' 'rsync' 'sqlite' 'systemd')
+optdepends=('docker: Docker consistency snapshots')
+makedepends=('rust>=1.85')
+options=('!debug')
+install=boxup.install
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('ce591663e627cd085df55037c875e388bdf0396f7f4e9c4c52164beff9b0d30f')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  test -d vendor
+  test -f .cargo/config.toml
+  sh scripts/check-rust-version.sh
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
+  cargo build --frozen --offline --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --frozen --offline
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/boxup "$pkgdir/usr/bin/boxup"
+  install -Dm755 target/release/boxup-root "$pkgdir/usr/lib/boxup/boxup-root"
+  install -Dm755 scripts/setup-profile.sh "$pkgdir/usr/lib/boxup/setup-profile"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/boxup/LICENSE"
+  install -Dm644 vendor/THIRD_PARTY_NOTICES \
+    "$pkgdir/usr/share/licenses/boxup/THIRD_PARTY_NOTICES"
+  install -Dm644 packaging/polkit/org.boxup.policy \
+    "$pkgdir/usr/share/polkit-1/actions/org.boxup.policy"
+  install -d "$pkgdir/usr/lib/systemd/system"
+  install -m644 packaging/systemd/* "$pkgdir/usr/lib/systemd/system/"
+  install -Dm644 examples/desktop.toml "$pkgdir/usr/share/doc/boxup/examples/desktop.toml"
+  install -Dm644 examples/ubuntu-docker-vps.toml \
+    "$pkgdir/usr/share/doc/boxup/examples/ubuntu-docker-vps.toml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/boxup/README.md"
+  install -Dm644 AGENTS.md "$pkgdir/usr/share/doc/boxup/AGENTS.md"
+  install -Dm644 docs/RESTORE.md "$pkgdir/usr/share/doc/boxup/RESTORE.md"
+  install -Dm644 docs/RESTORE.md "$pkgdir/usr/share/doc/boxup/docs/RESTORE.md"
+  install -Dm644 SECURITY.md "$pkgdir/usr/share/doc/boxup/SECURITY.md"
+}

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = remove ] && command -v systemctl >/dev/null 2>&1 && \
+  systemctl list-units --state=active --no-legend 'boxup-*' 2>/dev/null | grep -q .; then
+  echo 'Refusing removal while Boxup units are active. Stop them explicitly first.' >&2
+  exit 1
+fi
+
+exit 0

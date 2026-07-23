@@ -1,0 +1,18 @@
+[package]
+name = "r-efi"
+version = "6.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+rust-version = "1.68"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+"native" = []
+"rustc-dep-of-std" = ["core"]
+
+[dependencies."core"]
+version = "^1.0.0"
+package = "rustc-std-workspace-core"
+optional = true

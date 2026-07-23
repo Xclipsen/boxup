@@ -1,0 +1,25 @@
+[package]
+name = "redox_syscall"
+version = "0.5.18"
+edition = "2021"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+"default" = ["userspace"]
+"rustc-dep-of-std" = ["core", "bitflags/rustc-dep-of-std"]
+"std" = []
+"userspace" = []
+
+[dependencies."bitflags"]
+version = "^2.4"
+
+[dependencies."core"]
+version = "^1.0.0"
+package = "rustc-std-workspace-core"
+optional = true
+
+[target."cfg(loom)".dev-dependencies."loom"]
+version = "^0.7"

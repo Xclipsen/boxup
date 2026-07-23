@@ -1,0 +1,12 @@
+[package]
+name = "crossterm_winapi"
+version = "0.9.1"
+edition = "2021"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[target."cfg(windows)".dependencies."winapi"]
+version = "^0.3.8"
+features = ["winbase", "consoleapi", "processenv", "handleapi", "synchapi", "impl-default"]

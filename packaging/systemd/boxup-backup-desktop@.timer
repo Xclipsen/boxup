@@ -1,0 +1,12 @@
+[Unit]
+Description=Check whether the Boxup desktop backup for %i is due
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=4h
+AccuracySec=5min
+Persistent=true
+Unit=boxup-backup-due@%i.service
+
+[Install]
+WantedBy=timers.target

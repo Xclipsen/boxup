@@ -1,0 +1,15 @@
+Source: boxup
+Section: admin
+Priority: optional
+Maintainer: Xclipsen <101043764+Xclipsen@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.85), libsqlite3-dev, pkg-config, rustc (>= 1.85)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: boxup
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, acl, borgbackup (>= 1.4), curl, fuse3, openssh-client, pkexec, polkitd, python3, python3-pyfuse3, rsync, systemd
+Suggests: docker.io
+Description: policy-focused Borg 1.4 backup frontend
+ Boxup provides a user CLI, SQLite file index, terminal UI, fixed privileged
+ helper, safe staged restore, retention policy and optional Docker quiescing.

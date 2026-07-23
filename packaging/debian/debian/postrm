@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = remove ]; then
+  echo 'Boxup configuration, credentials, indexes, staging, and repositories were preserved.'
+fi
+
+exit 0

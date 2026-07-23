@@ -1,0 +1,11 @@
+[Unit]
+Description=Run weekly Boxup maintenance for %i
+
+[Timer]
+OnCalendar=Sun *-*-* 06:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=boxup-maintenance@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.85.0
+      - run: cargo check --locked --offline
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --check
+      - run: cargo check --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  static-packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.85.0
+      - run: sudo apt-get update && sudo apt-get install -y devscripts libxml2-utils shellcheck systemd
+      - run: shellcheck scripts/*.sh packaging/debian/build-deb.sh packaging/debian/debian/prerm packaging/debian/debian/postrm
+      - run: bash -n scripts/*.sh packaging/debian/build-deb.sh packaging/debian/debian/prerm packaging/debian/debian/postrm packaging/arch/PKGBUILD packaging/arch/boxup.install
+      - run: PYTHONPYCACHEPREFIX=/tmp/boxup-pycache python3 -m py_compile scripts/vendor-linux-dependencies.py
+      - run: sh scripts/verify-units.sh
+      - run: sh scripts/verify-source-archive.sh
+      - run: sh scripts/prepare-arch-package.sh && sh scripts/verify-packaging.sh
+      - run: xmllint --nonet --noout packaging/polkit/org.boxup.policy
+      - run: dpkg-parsechangelog -l packaging/debian/debian/changelog
+
+  package-arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm base-devel git rust borg openssh polkit python-pyfuse3 rsync
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: useradd --create-home builder && chown -R builder:builder .
+      - run: su builder -c 'cargo test --locked'
+      - run: su builder -c 'sh scripts/vendor-dependencies.sh'
+      - run: su builder -c 'sh scripts/prepare-arch-package.sh'
+      - run: su builder -c 'cd packaging/arch && makepkg --cleanbuild --noconfirm'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: boxup-arch
+          path: packaging/arch/*.pkg.tar.zst
+
+  package-ubuntu:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cargo debhelper devscripts libsqlite3-dev pkg-config rustc
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sh scripts/vendor-dependencies.sh
+      - run: ./packaging/debian/build-deb.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: boxup-ubuntu-26.04
+          path: dist/*.deb

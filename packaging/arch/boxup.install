@@ -1,0 +1,16 @@
+pre_remove() {
+  if command -v systemctl >/dev/null 2>&1 &&
+    systemctl list-units --state=active --no-legend 'boxup-*' 2>/dev/null | grep -q .; then
+    printf '%s\n' 'Refusing removal while Boxup units are active. Stop them explicitly first.' >&2
+    return 1
+  fi
+}
+
+post_install() {
+  printf '%s\n' 'Boxup installed. Create /etc/boxup/PROFILE.toml and credentials separately.'
+  printf '%s\n' 'No timers were enabled and no repository was initialized.'
+}
+
+post_remove() {
+  printf '%s\n' 'Boxup configuration, credentials, indexes, staging, and repositories were preserved.'
+}

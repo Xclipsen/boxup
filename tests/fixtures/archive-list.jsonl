@@ -1,0 +1,3 @@
+{"path":"etc","type":"d","size":0,"mtime":"2026-07-22T04:00:00.123456","mode":"drwxr-xr-x","uid":0,"gid":0,"user":0,"group":0,"healthy":true}
+{"path":"etc/hosts","type":"-","size":128,"mtime":"2026-07-22T04:00:00.123456","mode":"-rw-r--r--","uid":0,"gid":0,"user":"root","group":"root","healthy":true}
+{"path":"home/user/latest","type":"l","size":0,"mtime":"2026-07-22T04:00:00.123456","mode":"lrwxrwxrwx","uid":1000,"gid":1000,"user":1000,"group":"user","linktarget":"Documents","healthy":true}

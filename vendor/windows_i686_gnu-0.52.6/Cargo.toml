@@ -1,0 +1,9 @@
+[package]
+name = "windows_i686_gnu"
+version = "0.52.6"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.56"
+
+[lib]
+path = "src/lib.rs"

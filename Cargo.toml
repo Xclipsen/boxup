@@ -1,0 +1,48 @@
+[package]
+name = "boxup"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A policy-focused Borg 1.4 backup frontend"
+repository = "https://github.com/Xclipsen/boxup"
+
+[lib]
+name = "boxup"
+path = "src/lib.rs"
+
+[[bin]]
+name = "boxup"
+path = "src/bin/boxup.rs"
+
+[[bin]]
+name = "boxup-root"
+path = "src/bin/boxup-root.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+clap = { version = "4.5", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+crossterm = "0.29"
+futures = "0.3"
+libc = "0.2"
+nix = { version = "0.30", features = ["fs", "process", "signal", "user"] }
+ratatui = "0.29"
+rusqlite = { version = "0.37", features = ["modern_sqlite"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+strip = true
