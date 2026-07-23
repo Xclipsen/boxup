@@ -28,6 +28,25 @@ pub struct RestorePlan {
     manifest: BTreeMap<String, ArchiveItem>,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestorePhase {
+    Validating,
+    Extracting,
+    Verifying,
+    Publishing,
+    Complete,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RestoreProgress {
+    pub phase: RestorePhase,
+    pub current: u64,
+    pub total: u64,
+    pub files: u64,
+    pub bytes: u64,
+}
+
 pub async fn restore<B: Backend + ?Sized>(
     backend: &B,
     config: &Config,
@@ -127,6 +146,230 @@ pub async fn restore_overwrite_root<B: Backend + ?Sized>(
     Ok(plan)
 }
 
+pub async fn restore_original_root<B, F>(
+    backend: &B,
+    config: &Config,
+    snapshot: &str,
+    inputs: &[String],
+    progress: F,
+) -> Result<RestorePlan>
+where
+    B: Backend + ?Sized,
+    F: Fn(RestoreProgress),
+{
+    ensure!(
+        nix::unistd::Uid::effective().is_root(),
+        "original-path restore requires root"
+    );
+    let paths = minimal_restore_paths(normalize_paths(config, inputs)?);
+    for path in &paths {
+        ensure_not_denied(config, path, false)?;
+    }
+    create_directory_all_no_follow(&config.backup.state_dir, Mode::from_bits_truncate(0o700))?;
+    let _lock = LocalLock::acquire(&config.backup.state_dir, LockMode::Shared)?;
+    progress(RestoreProgress {
+        phase: RestorePhase::Validating,
+        current: 0,
+        total: 0,
+        files: 0,
+        bytes: 0,
+    });
+    let plan =
+        validate_live_selection_with_progress(backend, config, snapshot, &paths, |scanned| {
+            progress(RestoreProgress {
+                phase: RestorePhase::Validating,
+                current: scanned,
+                total: 0,
+                files: 0,
+                bytes: 0,
+            });
+        })
+        .await?;
+
+    let publication_paths = original_publication_paths(&paths)?;
+    let staging_root = original_restore_staging(config, &publication_paths)?;
+
+    let staging = Builder::new()
+        .prefix("original-")
+        .tempdir_in(&staging_root)?;
+    revalidate_snapshot(backend, &plan).await?;
+    let (progress_sender, mut progress_receiver) =
+        tokio::sync::watch::channel(crate::domain::ExtractProgress {
+            current: 0,
+            total: plan.bytes.max(1),
+        });
+    progress(RestoreProgress {
+        phase: RestorePhase::Extracting,
+        current: 0,
+        total: plan.bytes,
+        files: plan.files,
+        bytes: plan.bytes,
+    });
+    let plan_snapshot = plan.snapshot.clone();
+    let extraction =
+        backend.extract_with_progress(&plan_snapshot, &paths, staging.path(), progress_sender);
+    tokio::pin!(extraction);
+    loop {
+        tokio::select! {
+            result = &mut extraction => {
+                result?;
+                break;
+            }
+            changed = progress_receiver.changed() => {
+                if changed.is_ok() {
+                    let value = *progress_receiver.borrow_and_update();
+                    progress(RestoreProgress {
+                        phase: RestorePhase::Extracting,
+                        current: value.current,
+                        total: value.total,
+                        files: plan.files,
+                        bytes: plan.bytes,
+                    });
+                }
+            }
+        }
+    }
+    progress(RestoreProgress {
+        phase: RestorePhase::Verifying,
+        current: 0,
+        total: plan.files,
+        files: plan.files,
+        bytes: plan.bytes,
+    });
+    verify_extracted_manifest(staging.path(), &plan, config)?;
+    revalidate_snapshot(backend, &plan).await?;
+
+    for (position, path) in publication_paths.iter().enumerate() {
+        progress(RestoreProgress {
+            phase: RestorePhase::Publishing,
+            current: position as u64,
+            total: publication_paths.len() as u64,
+            files: plan.files,
+            bytes: plan.bytes,
+        });
+        publish_original_path(&staging.path().join(path), &Path::new("/").join(path))?;
+    }
+    progress(RestoreProgress {
+        phase: RestorePhase::Complete,
+        current: publication_paths.len() as u64,
+        total: publication_paths.len() as u64,
+        files: plan.files,
+        bytes: plan.bytes,
+    });
+    Ok(plan)
+}
+
+fn minimal_restore_paths(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort();
+    let mut minimal: Vec<String> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !minimal
+            .iter()
+            .any(|ancestor| archive_path_matches(&path, ancestor))
+        {
+            minimal.push(path);
+        }
+    }
+    minimal
+}
+
+fn original_publication_paths(paths: &[String]) -> Result<Vec<String>> {
+    let mut publication = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mut candidate = Path::new("/").join(path);
+        let mut root = path.clone();
+        loop {
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    root = candidate
+                        .strip_prefix("/")?
+                        .to_str()
+                        .context("original restore target is not UTF-8")?
+                        .to_owned();
+                    candidate = candidate
+                        .parent()
+                        .context("original restore target has no existing ancestor")?
+                        .to_path_buf();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        ensure_no_symlink_components(&candidate)?;
+        ensure!(
+            candidate.is_dir(),
+            "original restore target parent is not a directory: {}",
+            candidate.display()
+        );
+        publication.push(root);
+    }
+    Ok(minimal_restore_paths(publication))
+}
+
+fn original_restore_staging(config: &Config, paths: &[String]) -> Result<PathBuf> {
+    create_directory_all_no_follow(&config.restore.staging_dir, Mode::from_bits_truncate(0o700))?;
+    let configured_device = open_directory_no_follow(&config.restore.staging_dir)?
+        .metadata()?
+        .dev();
+    let mut target_device = None;
+    let mut first_parent = None;
+    for path in paths {
+        let target = Path::new("/").join(path);
+        let parent = target
+            .parent()
+            .context("original restore target has no parent")?;
+        ensure_no_symlink_components(parent)?;
+        let device = open_directory_no_follow(parent)?.metadata()?.dev();
+        ensure!(
+            target_device.is_none_or(|expected| expected == device),
+            "one original-path restore cannot span multiple filesystems"
+        );
+        target_device = Some(device);
+        first_parent.get_or_insert_with(|| parent.to_path_buf());
+    }
+    let target_device = target_device.context("original restore has no target filesystem")?;
+    if target_device == configured_device {
+        return Ok(config.restore.staging_dir.clone());
+    }
+
+    let mut filesystem_root = first_parent.context("original restore has no target parent")?;
+    while let Some(parent) = filesystem_root.parent() {
+        if open_directory_no_follow(parent)?.metadata()?.dev() != target_device {
+            break;
+        }
+        filesystem_root = parent.to_path_buf();
+    }
+    let root_metadata = fs::symlink_metadata(&filesystem_root)?;
+    ensure!(
+        root_metadata.is_dir()
+            && !root_metadata.file_type().is_symlink()
+            && root_metadata.uid() == 0
+            && root_metadata.mode() & 0o022 == 0,
+        "target filesystem root is not a root-owned non-writable directory: {}",
+        filesystem_root.display()
+    );
+    let fallback = filesystem_root.join(".boxup-restore").join(&config.host.id);
+    for path in paths {
+        let target = Path::new("/").join(path);
+        ensure!(
+            target != fallback && !target.starts_with(&fallback) && !fallback.starts_with(&target),
+            "original restore target overlaps fallback staging: {}",
+            target.display()
+        );
+    }
+    create_directory_all_no_follow(&fallback, Mode::from_bits_truncate(0o700))?;
+    let metadata = fs::symlink_metadata(&fallback)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o077 == 0,
+        "fallback restore staging is not root-owned mode 0700: {}",
+        fallback.display()
+    );
+    Ok(fallback)
+}
+
 pub fn normalize_paths(config: &Config, inputs: &[String]) -> Result<Vec<String>> {
     config.validate()?;
     ensure!(!inputs.is_empty(), "at least one restore path is required");
@@ -191,6 +434,20 @@ async fn validate_live_selection<B: Backend + ?Sized>(
     snapshot: &str,
     paths: &[String],
 ) -> Result<RestorePlan> {
+    validate_live_selection_with_progress(backend, config, snapshot, paths, |_| {}).await
+}
+
+async fn validate_live_selection_with_progress<B, F>(
+    backend: &B,
+    config: &Config,
+    snapshot: &str,
+    paths: &[String],
+    mut progress: F,
+) -> Result<RestorePlan>
+where
+    B: Backend + ?Sized,
+    F: FnMut(u64),
+{
     let snapshots = backend.list_snapshots().await?;
     let mut matching = snapshots
         .into_iter()
@@ -203,12 +460,19 @@ async fn validate_live_selection<B: Backend + ?Sized>(
         "live repository returned a duplicate snapshot name"
     );
     validate_archive_id(&snapshot.id)?;
-    let mut stream = backend.list_files(&snapshot.name, None).await?;
+    let mut stream = backend.list_files_selected(&snapshot.name, paths).await?;
     let mut files = 0_u64;
     let mut bytes = 0_u64;
+    let mut scanned = 0_u64;
     let mut found = vec![false; paths.len()];
     let mut manifest = BTreeMap::new();
     while let Some(item) = stream.try_next().await? {
+        scanned = scanned
+            .checked_add(1)
+            .context("archive scan count overflow")?;
+        if scanned == 1 || scanned % 250 == 0 {
+            progress(scanned);
+        }
         validate_archive_path(&item.path)
             .with_context(|| format!("live archive contains an unsafe path: {:?}", item.path))?;
         let selected = paths
@@ -259,6 +523,7 @@ async fn validate_live_selection<B: Backend + ?Sized>(
             );
         }
     }
+    progress(scanned);
     for (path, exists) in paths.iter().zip(found) {
         ensure!(exists, "selected path is absent from live snapshot: {path}");
     }
@@ -601,6 +866,36 @@ fn publish_directory(staging: &Path, target: &Path) -> Result<()> {
         RenameFlags::RENAME_NOREPLACE,
     )
     .context("atomic no-replace restore publication failed")?;
+    Ok(())
+}
+
+fn publish_original_path(source: &Path, target: &Path) -> Result<()> {
+    let source_parent_path = source.parent().context("staged path has no parent")?;
+    let target_parent_path = target.parent().context("target path has no parent")?;
+    ensure_no_symlink_components(target_parent_path)?;
+    let source_parent = open_directory_no_follow(source_parent_path)?;
+    let target_parent = open_directory_no_follow(target_parent_path)?;
+    let source_name = source.file_name().context("staged path has no file name")?;
+    let target_name = target.file_name().context("target path has no file name")?;
+    match fs::symlink_metadata(target) {
+        Ok(_) => renameat2(
+            &source_parent,
+            source_name,
+            &target_parent,
+            target_name,
+            RenameFlags::RENAME_EXCHANGE,
+        )
+        .context("atomic original-path replacement failed")?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => renameat2(
+            &source_parent,
+            source_name,
+            &target_parent,
+            target_name,
+            RenameFlags::RENAME_NOREPLACE,
+        )
+        .context("atomic original-path publication failed")?,
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -966,6 +1261,56 @@ mod tests {
 
         assert_eq!(fs::read_to_string(target.join("restored")).unwrap(), "data");
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn original_path_publication_exactly_replaces_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged/hypr");
+        let target = temp.path().join("home/hypr");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(staged.join("old-config"), "snapshot").unwrap();
+        fs::write(target.join("new-only"), "current").unwrap();
+
+        publish_original_path(&staged, &target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("old-config")).unwrap(),
+            "snapshot"
+        );
+        assert!(!target.join("new-only").exists());
+        assert_eq!(
+            fs::read_to_string(staged.join("new-only")).unwrap(),
+            "current"
+        );
+    }
+
+    #[test]
+    fn parent_restore_selection_supersedes_selected_descendants() {
+        assert_eq!(
+            minimal_restore_paths(vec![
+                "home/la/.config/hypr/hyprland.conf".into(),
+                "home/la/.config/hypr".into(),
+                "home/la/Documents".into(),
+            ]),
+            ["home/la/.config/hypr", "home/la/Documents"]
+        );
+    }
+
+    #[test]
+    fn missing_original_parents_are_published_as_one_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("Bewerbungsunterlagen");
+        let paths = [missing.join("CV"), missing.join("Minijobs")]
+            .map(|path| path.strip_prefix("/").unwrap().display().to_string());
+
+        let publication = original_publication_paths(&paths).unwrap();
+
+        assert_eq!(
+            publication,
+            [missing.strip_prefix("/").unwrap().display().to_string()]
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -58,6 +59,13 @@ enum Operation {
         #[arg(required = true)]
         paths: Vec<String>,
     },
+    RestoreOriginal {
+        #[arg(long)]
+        confirm: String,
+        snapshot: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -67,6 +75,7 @@ async fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
     if let Err(error) = run().await {
         tracing::error!("{error:#}");
@@ -184,6 +193,24 @@ async fn run() -> Result<()> {
         Operation::RestoreOverwrite { snapshot, paths } => {
             boxup::restore::restore_overwrite_root(&backend, &config, &snapshot, &paths).await?;
         }
+        Operation::RestoreOriginal {
+            confirm,
+            snapshot,
+            paths,
+        } => {
+            ensure!(
+                confirm == "RESTORE",
+                "original-path restore confirmation did not match"
+            );
+            boxup::restore::restore_original_root(&backend, &config, &snapshot, &paths, |event| {
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).expect("restore progress is serializable")
+                );
+                let _ = std::io::stdout().flush();
+            })
+            .await?;
+        }
         Operation::Prepare | Operation::ValidateConfig | Operation::PrintSchedule => unreachable!(),
     }
     Ok(())
@@ -270,4 +297,36 @@ fn validate_system_credentials(config: &Config) -> Result<()> {
         "known_hosts must be a root-owned non-writable regular file"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_restore_accepts_literal_option_shaped_paths() {
+        let cli = Cli::try_parse_from([
+            "boxup-root",
+            "--config",
+            "/etc/boxup/desktop.toml",
+            "restore-original",
+            "--confirm",
+            "RESTORE",
+            "desktop-archive",
+            "--",
+            "-literal",
+        ])
+        .unwrap();
+        let Operation::RestoreOriginal {
+            confirm,
+            snapshot,
+            paths,
+        } = cli.operation
+        else {
+            panic!("restore-original was not parsed");
+        };
+        assert_eq!(confirm, "RESTORE");
+        assert_eq!(snapshot, "desktop-archive");
+        assert_eq!(paths, ["-literal"]);
+    }
 }

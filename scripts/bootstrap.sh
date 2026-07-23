@@ -13,7 +13,7 @@ if command -v pacman >/dev/null 2>&1; then
   (cd packaging/arch && makepkg --cleanbuild)
   package=$(find packaging/arch -maxdepth 1 -name 'boxup-0.1.0-1-*.pkg.tar.zst' -print -quit)
   [ -n "$package" ]
-  pkexec pacman -U "$package"
+  pkexec pacman -U "$project_dir/$package"
 elif command -v apt-get >/dev/null 2>&1; then
   pkexec apt-get install acl build-essential borgbackup cargo curl debhelper fuse3 openssh-client pkexec polkitd python3-pyfuse3 rsync rustc
   sh scripts/check-rust-version.sh
@@ -22,7 +22,7 @@ elif command -v apt-get >/dev/null 2>&1; then
   ./packaging/debian/build-deb.sh
   package=$(find dist -maxdepth 1 -name 'boxup_0.1.0-1_*.deb' -print -quit)
   [ -n "$package" ]
-  pkexec apt-get install "$package"
+  pkexec apt-get install "$project_dir/$package"
 else
   echo 'Unsupported distribution; use the Arch or Debian packaging files.' >&2
   exit 1

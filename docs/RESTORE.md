@@ -57,6 +57,43 @@ The generated `STATE/inventory/ARCHIVE.json` follows the same rule: it may be
 selected from an archive and restored to a safe external destination, while the
 live Boxup state directory remains protected as a restore destination.
 
+## Interactive Original-Path Restore
+
+The TUI provides an explicit exact-replacement workflow for selected paths from
+a `/etc/boxup/*.toml` system profile:
+
+1. Select a snapshot and one or more files or directories with Space.
+2. Press `R` and review every absolute destination shown by the TUI.
+3. Type exactly `RESTORE` and press Enter.
+4. Keep the machine powered on while validation, extraction, verification, and
+   publication progress is displayed.
+
+Archive paths are mapped literally below `/`. Thus
+`home/alice/.config/hypr` maps to `/home/alice/.config/hypr`; Boxup does not
+infer `~` from the user running the TUI. The selected path is replaced exactly,
+not merged. Files existing only in the current destination disappear. No
+rollback copy is retained.
+
+If a selected path has missing destination parents, Boxup publishes the highest
+missing parent from the verified staged tree. Selecting children below a missing
+`/home/alice/Documents/recovery` therefore creates that directory with archived
+metadata and all selected children in one atomic publication.
+
+The fixed root helper repeats live snapshot and manifest validation, applies all
+protected-path and restore-limit checks, extracts into isolated staging, and
+revalidates the immutable Borg archive ID before publication. Existing parent
+symlinks are refused. Publication of each selected root uses
+`renameat2(RENAME_EXCHANGE)` when the destination exists and
+`RENAME_NOREPLACE` when it does not. If the configured staging directory is on
+another filesystem, Boxup creates root-owned mode-0700 fallback staging under
+`.boxup-restore/HOST` at the root of the target filesystem. One operation cannot
+span multiple target filesystems.
+
+Each selected root is replaced atomically, but a multi-path operation is not one
+transaction: a failure or power loss can occur after an earlier path has already
+been replaced. Prefer restoring one logical directory at a time. Use Normal
+Restore when inspection or a retained copy of current data is required.
+
 ## Overwrite Restore
 
 Overwrite is an emergency operation, not a normal recovery shortcut. It is only

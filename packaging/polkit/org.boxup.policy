@@ -4,7 +4,7 @@
 <policyconfig>
   <vendor>Boxup</vendor>
   <action id="org.boxup.run-fixed-helper">
-    <description>Run a fixed Boxup backup or validated overwrite restore</description>
+    <description>Run a fixed Boxup backup or validated restore</description>
     <message>Authentication is required to run a privileged Boxup operation</message>
     <defaults>
       <allow_any>no</allow_any>

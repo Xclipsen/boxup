@@ -148,6 +148,20 @@ pkexec /usr/bin/boxup --config /etc/boxup/desktop.toml restore \
 Inspect the restored files before copying selected data into the live system.
 Avoid restoring an entire old `.config` over a fresh desktop installation.
 
+The terminal browser can deliberately restore a selected file or directory to
+its archived absolute path. Run `boxup tui`, select entries with Space, press
+`R`, review the displayed `/...` targets, and type `RESTORE`. For example, the
+archive path `home/alice/.config/hypr` exactly replaces
+`/home/alice/.config/hypr`; files present only in the current directory are
+removed. The TUI displays live validation, Borg extraction, verification, and
+publication progress.
+
+Original-path restore is available only with a system profile under
+`/etc/boxup` and the fixed privileged helper. Staging and every selected target
+must resolve to one filesystem; Boxup creates protected fallback staging on that
+filesystem when needed. Prefer one logical path per operation and use a normal
+restore when you need to inspect data before replacement.
+
 Root overwrite exists only for disaster recovery and is intentionally difficult.
 See [Restore And Recovery](docs/RESTORE.md) for mounts, Docker data, metadata,
 rehearsals, and emergency restore behavior.
@@ -192,6 +206,12 @@ boxup tui
 
 The SQLite index is only a browsing cache. Restore, retention, initialization,
 and repository checks use live Borg data.
+
+The TUI supports Yazi-style navigation: `j`/`k` move down/up, `l` opens a
+directory or enters the file pane, and `h` goes to the parent directory or back
+to the snapshot pane. Arrow keys, Enter, Backspace, Home, and End remain
+available. `/` filters only the directly visible entries in the currently open
+directory; it does not search the complete snapshot.
 
 ## Docker Hosts
 

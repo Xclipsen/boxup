@@ -16,7 +16,8 @@
   or any destructive decision.
 - Keep restore default-deny: live snapshot validation, normalized literal paths,
   protected-path denial, limits, special-file checks, isolated staging, no
-  overwrite, and no symlink traversal.
+  overwrite by default, explicit confirmation for original-path replacement,
+  and no symlink traversal.
 - Root-helper operations must stay fixed and profiles must remain constrained to
   canonical, root-owned, non-writable `/etc/boxup/*.toml` files.
 - Packaging may install immutable `/usr` files only. Setup, credentials, state,

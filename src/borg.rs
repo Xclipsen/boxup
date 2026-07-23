@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -24,7 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{Backend, DiffStream, FileStream};
 use crate::config::{Config, RepositoryConfig, validate_id};
 use crate::domain::{
-    ArchiveItem, CreateRequest, DiffEntry, FileType, RepositoryIdentity, Snapshot,
+    ArchiveItem, CreateRequest, DiffEntry, ExtractProgress, FileType, RepositoryIdentity, Snapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,58 @@ impl BorgRunner {
             .await
             .context("failed to wait for Borg")?;
         classify_output(output.status.code(), output.stdout, output.stderr)
+    }
+
+    async fn run_extract_with_progress<I, S>(
+        &self,
+        args: I,
+        cwd: &Path,
+        progress: tokio::sync::watch::Sender<ExtractProgress>,
+    ) -> Result<BorgOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let (mut command, passphrase) = self.command(args, Some(cwd), false).await?;
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = spawn_with_passphrase(command, passphrase).await?;
+        let mut stdout = child.stdout.take().context("Borg stdout was unavailable")?;
+        let stderr = child.stderr.take().context("Borg stderr was unavailable")?;
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await?;
+            Result::<Vec<u8>>::Ok(bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(line) = lines.next_line().await? {
+                if line.len() > 64 * 1024 {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<BorgProgressLine>(&line) else {
+                    continue;
+                };
+                if event.kind.as_deref() == Some("progress_percent")
+                    && event.msgid.as_deref() == Some("extract")
+                    && !event.finished
+                {
+                    if let (Some(current), Some(total)) = (event.current, event.total) {
+                        if total > 0 {
+                            let _ = progress.send(ExtractProgress {
+                                current: current.min(total),
+                                total,
+                            });
+                        }
+                    }
+                }
+            }
+            Result::<()>::Ok(())
+        });
+        let status = child.wait().await.context("failed to wait for Borg")?;
+        let stdout = stdout_task.await.context("Borg stdout task failed")??;
+        stderr_task.await.context("Borg progress task failed")??;
+        // Progress JSON contains archive paths, so never include raw stderr in errors.
+        classify_output(status.code(), stdout, Vec::new())
     }
 
     async fn stream_json_lines<I, S, T, F>(
@@ -326,6 +379,39 @@ impl Backend for BorgBackend {
         })))
     }
 
+    async fn list_files_selected(&self, snapshot: &str, paths: &[String]) -> Result<FileStream> {
+        validate_id("snapshot", snapshot)?;
+        ensure!(!paths.is_empty(), "file selection cannot be empty");
+        let mut ancestors = BTreeSet::new();
+        for path in paths {
+            validate_literal_archive_path(path)?;
+            let mut parent = Path::new(path).parent();
+            while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+                ancestors.insert(
+                    path.to_str()
+                        .context("archive path ancestor is not UTF-8")?
+                        .to_owned(),
+                );
+                parent = path.parent();
+            }
+        }
+        let mut args: Vec<OsString> = vec!["list".into(), "--json-lines".into()];
+        for ancestor in ancestors {
+            args.push("--pattern".into());
+            args.push(format!("+ pf:{ancestor}").into());
+        }
+        for path in paths {
+            args.push("--pattern".into());
+            args.push(format!("+ pp:{path}").into());
+        }
+        args.push("--pattern".into());
+        args.push("- re:.*".into());
+        args.push(format!("::{snapshot}").into());
+        self.runner
+            .stream_json_lines(args, false, parse_archive_item)
+            .await
+    }
+
     async fn create(&self, request: &CreateRequest) -> Result<Snapshot> {
         validate_id("archive name", &request.archive_name)?;
         let mut args: Vec<OsString> = vec!["create".into(), "--json".into(), "--stats".into()];
@@ -376,6 +462,33 @@ impl Backend for BorgBackend {
         args.push("- re:.*".into());
         args.push(format!("::{snapshot}").into());
         require_success(self.runner.run(args, Some(destination), false).await?)?;
+        Ok(())
+    }
+
+    async fn extract_with_progress(
+        &self,
+        snapshot: &str,
+        paths: &[String],
+        destination: &Path,
+        progress: tokio::sync::watch::Sender<ExtractProgress>,
+    ) -> Result<()> {
+        validate_id("snapshot", snapshot)?;
+        ensure!(!paths.is_empty(), "extract requires at least one path");
+        let mut args: Vec<OsString> =
+            vec!["extract".into(), "--progress".into(), "--log-json".into()];
+        for path in paths {
+            validate_literal_archive_path(path)?;
+            args.push("--pattern".into());
+            args.push(format!("+ pp:{path}").into());
+        }
+        args.push("--pattern".into());
+        args.push("- re:.*".into());
+        args.push(format!("::{snapshot}").into());
+        require_success(
+            self.runner
+                .run_extract_with_progress(args, destination, progress)
+                .await?,
+        )?;
         Ok(())
     }
 
@@ -722,6 +835,17 @@ struct ArchiveItemRaw {
     link_target: Option<String>,
     #[serde(default)]
     healthy: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct BorgProgressLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    msgid: Option<String>,
+    current: Option<u64>,
+    total: Option<u64>,
+    #[serde(default)]
+    finished: bool,
 }
 
 fn parse_archive_item(line: &str) -> Result<ArchiveItem> {
