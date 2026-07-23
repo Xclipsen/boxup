@@ -70,6 +70,7 @@ jobs:
     steps:
       - run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cargo debhelper devscripts git libsqlite3-dev pkg-config rustc
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: sh scripts/vendor-dependencies.sh
       - run: ./packaging/debian/build-deb.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
