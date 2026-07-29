@@ -12,7 +12,7 @@ makedepends=('rust>=1.85')
 options=('!debug')
 install=boxup.install
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('71c89e643700674822764c4cfbc7cae5e5b0cf169a05f02fe4be7d71731369cd')
+sha256sums=('97c06b02155460d0034370653acef401b8a727fe22be2cd5ed9202726faee042')
 
 prepare() {
   cd "$pkgname-$pkgver"

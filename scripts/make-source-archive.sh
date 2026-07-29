@@ -125,7 +125,7 @@ fi
 git -C "$project_dir" ls-files -z -- vendor >>"$temporary_files"
 
 tar --sort=name --format=posix --mtime="@$epoch" --owner=0 --group=0 \
-  --numeric-owner --pax-option=delete=atime,delete=ctime \
+  --numeric-owner --mode='u+rwX,go+rX,go-w' --pax-option=delete=atime,delete=ctime \
   --null --verbatim-files-from --no-recursion \
   --transform="s,^,boxup-$version/," -C "$project_dir" \
   -cf "$temporary_tar" --files-from="$temporary_files"
