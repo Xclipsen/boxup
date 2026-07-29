@@ -178,6 +178,38 @@ On a headless server, invoke the same fixed helper through an audited root
 session. Do not weaken permissions to make the normal user read `/etc/boxup`.
 The helper must report that it initialized no repository and enabled no timer.
 
+## Audit And Update Backup Sources
+
+Use this procedure when Boxup reports that configured folders were not present,
+or when adapting a recovered profile to a replacement system:
+
+1. Keep all Boxup timers disabled and confirm that no backup, index, maintenance,
+   check, Borg, or repository SSH process is active.
+2. Copy the root-owned profile to a private local working file without copying or
+   printing credential contents. Preserve repository, host, credential, policy,
+   state, index, and restore settings unless the user explicitly requests another
+   change.
+3. Check every `backup.sources` entry with non-following metadata first. Record
+   whether it is present, absent, or a symlink; do not create an empty directory
+   merely to silence a missing-source warning.
+4. Inspect active mounts, filesystem IDs, Btrfs subvolumes, and symlink targets.
+   With `one_file_system = true`, every important mounted filesystem or subvolume
+   must be an explicit source. Do not automatically add removable, temporary,
+   network, FUSE, recovery, or cloud-synchronized mounts.
+5. Ask the user before removing an ambiguous source or adding a new data root.
+   A clearly distribution-specific absent path, such as `/var/backups` on a system
+   that has no such directory or workload, may be removed after documenting the
+   evidence. Never infer that an absent mount means its data is unimportant.
+6. Re-audit Docker volumes, bind mounts, databases, VMs, and managed services.
+   Configure application-aware staging or quiescing before claiming consistency.
+7. Validate the edited working profile against the exact intended system-profile
+   path. Install it atomically as root with owner `root:root` and mode `0600`, then
+   validate the installed file again. Do not overwrite credential files or run
+   `setup-profile` merely to change source paths.
+8. Re-check that automation remains disabled. Run one deliberate backup, inspect
+   any notes, verify the archive live, refresh the browsing index separately, and
+   perform a representative restore before re-enabling timers.
+
 For every existing repository, the next command is **never** `boxup init`.
 Initialization is only for a separately verified, empty, new namespace. Running
 it against a missing-looking path without first proving the intended URI is a

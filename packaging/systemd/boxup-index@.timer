@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh the Boxup browsing index for %i in the background
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+AccuracySec=5min
+RandomizedDelaySec=15min
+Persistent=true
+Unit=boxup-index@%i.service
+
+[Install]
+WantedBy=timers.target

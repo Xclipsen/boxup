@@ -11,10 +11,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::backend::Backend;
 use crate::domain::{
-    ArchiveItem, FileType, JobRecord, JobState, RepositoryIdentity, Snapshot, utc_now,
+    ArchiveItem, BackupProgress, FileType, JobRecord, JobState, RepositoryIdentity, Snapshot,
+    utc_now,
 };
 
-pub const INDEX_SCHEMA_VERSION: u32 = 1;
+pub const INDEX_SCHEMA_VERSION: u32 = 2;
 
 pub struct Index {
     path: PathBuf,
@@ -305,17 +306,56 @@ impl Index {
 
     pub fn start_job(&self, kind: &str) -> Result<i64> {
         let connection = self.connect()?;
+        let now = utc_now().to_rfc3339();
         connection.execute(
-            "INSERT INTO jobs(kind, state, started_at) VALUES (?1, 'running', ?2)",
-            params![kind, utc_now().to_rfc3339()],
+            "INSERT INTO jobs(kind, state, started_at, updated_at)
+             VALUES (?1, 'running', ?2, ?2)",
+            params![kind, now],
         )?;
         Ok(connection.last_insert_rowid())
+    }
+
+    pub fn update_job_progress(&self, id: i64, progress: &BackupProgress) -> Result<()> {
+        let connection = self.connect()?;
+        connection.execute(
+            "UPDATE jobs SET phase = ?1, updated_at = ?2, files = ?3,
+                 original_bytes = ?4, compressed_bytes = ?5, deduplicated_bytes = ?6
+             WHERE id = ?7 AND state = 'running'",
+            params![
+                progress.phase.as_str(),
+                utc_now().to_rfc3339(),
+                sqlite_u64(progress.files)?,
+                sqlite_u64(progress.original_bytes)?,
+                sqlite_u64(progress.compressed_bytes)?,
+                sqlite_u64(progress.deduplicated_bytes)?,
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_job_archive(
+        &self,
+        id: i64,
+        name: &str,
+        archive_id: &str,
+        stats_recorded: bool,
+    ) -> Result<()> {
+        let connection = self.connect()?;
+        connection.execute(
+            "UPDATE jobs SET archive_name = ?1, archive_id = ?2, updated_at = ?3,
+                 stats_recorded = ?4
+             WHERE id = ?5 AND state = 'running'",
+            params![name, archive_id, utc_now().to_rfc3339(), stats_recorded, id],
+        )?;
+        Ok(())
     }
 
     pub fn finish_job(&self, id: i64, success: bool, message: Option<&str>) -> Result<()> {
         let connection = self.connect()?;
         connection.execute(
-            "UPDATE jobs SET state = ?1, finished_at = ?2, message = ?3 WHERE id = ?4",
+            "UPDATE jobs SET state = ?1, finished_at = ?2, updated_at = ?2, message = ?3
+             WHERE id = ?4",
             params![
                 if success { "succeeded" } else { "failed" },
                 utc_now().to_rfc3339(),
@@ -328,30 +368,115 @@ impl Index {
 
     pub fn recent_jobs(&self, limit: u32) -> Result<Vec<JobRecord>> {
         let connection = self.connect()?;
-        let mut statement = connection.prepare(
-            "SELECT id, kind, state, started_at, finished_at, message
-             FROM jobs ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map([limit], |row| {
-            let state: String = row.get(2)?;
-            Ok(JobRecord {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                state: match state.as_str() {
-                    "succeeded" => JobState::Succeeded,
-                    "failed" => JobState::Failed,
-                    _ => JobState::Running,
-                },
-                started_at: parse_time(row.get::<_, String>(3)?, 3)?,
-                finished_at: row
-                    .get::<_, Option<String>>(4)?
-                    .map(|value| parse_time(value, 4))
-                    .transpose()?,
-                message: row.get(5)?,
-            })
-        })?;
+        let columns = if jobs_have_progress_columns(&connection)? {
+            "phase, updated_at, files, original_bytes, compressed_bytes,
+             deduplicated_bytes, archive_name, archive_id, stats_recorded"
+        } else {
+            "NULL, NULL, 0, 0, 0, 0, NULL, NULL, 0"
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, kind, state, started_at, finished_at, message, {columns}
+             FROM jobs ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([limit], job_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn last_success_job(&self, kind: &str) -> Result<Option<JobRecord>> {
+        let connection = self.connect()?;
+        let columns = if jobs_have_progress_columns(&connection)? {
+            "phase, updated_at, files, original_bytes, compressed_bytes,
+             deduplicated_bytes, archive_name, archive_id, stats_recorded"
+        } else {
+            "NULL, NULL, 0, 0, 0, 0, NULL, NULL, 0"
+        };
+        connection
+            .query_row(
+                &format!(
+                    "SELECT id, kind, state, started_at, finished_at, message, {columns}
+                 FROM jobs WHERE kind = ?1 AND state = 'succeeded'
+                 ORDER BY finished_at DESC LIMIT 1"
+                ),
+                [kind],
+                job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_job(&self, kind: &str) -> Result<Option<JobRecord>> {
+        let connection = self.connect()?;
+        let columns = if jobs_have_progress_columns(&connection)? {
+            "phase, updated_at, files, original_bytes, compressed_bytes,
+             deduplicated_bytes, archive_name, archive_id, stats_recorded"
+        } else {
+            "NULL, NULL, 0, 0, 0, 0, NULL, NULL, 0"
+        };
+        connection
+            .query_row(
+                &format!(
+                    "SELECT id, kind, state, started_at, finished_at, message, {columns}
+                     FROM jobs WHERE kind = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                [kind],
+                job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn running_jobs(&self) -> Result<Vec<JobRecord>> {
+        let connection = self.connect()?;
+        let columns = if jobs_have_progress_columns(&connection)? {
+            "phase, updated_at, files, original_bytes, compressed_bytes,
+             deduplicated_bytes, archive_name, archive_id, stats_recorded"
+        } else {
+            "NULL, NULL, 0, 0, 0, 0, NULL, NULL, 0"
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, kind, state, started_at, finished_at, message, {columns}
+             FROM jobs WHERE state = 'running' ORDER BY id DESC"
+        ))?;
+        let rows = statement.query_map([], job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn estimated_backup_seconds(&self, limit: u32) -> Result<Option<u64>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT started_at, finished_at FROM jobs
+             WHERE kind = 'backup' AND state = 'succeeded' AND finished_at IS NOT NULL
+             ORDER BY finished_at DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut durations = Vec::new();
+        for row in rows {
+            let (started, finished) = row?;
+            let seconds = parse_datetime(&finished)?
+                .signed_duration_since(parse_datetime(&started)?)
+                .num_seconds();
+            if (1..=7 * 24 * 60 * 60).contains(&seconds) {
+                durations.push(seconds as u64);
+            }
+        }
+        if durations.len() < 3 {
+            return Ok(None);
+        }
+        durations.sort_unstable();
+        let middle = durations.len() / 2;
+        let median = if durations.len() % 2 == 0 {
+            durations[middle - 1]
+                .checked_add(durations[middle])
+                .context("backup duration estimate overflow")?
+                / 2
+        } else {
+            durations[middle]
+        };
+        Ok(Some(median))
     }
 
     pub fn last_success(&self, kind: &str) -> Result<Option<DateTime<Utc>>> {
@@ -382,7 +507,11 @@ impl Index {
         if !self.read_only {
             connection.pragma_update(None, "journal_mode", "DELETE")?;
         }
-        connection.busy_timeout(std::time::Duration::from_secs(10))?;
+        connection.busy_timeout(if self.read_only {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(10)
+        })?;
         Ok(connection)
     }
 
@@ -507,7 +636,8 @@ fn initialize(connection: &Connection) -> Result<()> {
         existing_version <= INDEX_SCHEMA_VERSION,
         "index schema version {existing_version} is newer than supported version {INDEX_SCHEMA_VERSION}"
     );
-    connection.execute_batch(
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS archives (
             id INTEGER PRIMARY KEY,
             borg_id TEXT NOT NULL,
@@ -553,7 +683,16 @@ fn initialize(connection: &Connection) -> Result<()> {
             state TEXT NOT NULL CHECK(state IN ('running', 'succeeded', 'failed')),
             started_at TEXT NOT NULL,
             finished_at TEXT,
-            message TEXT
+            message TEXT,
+            phase TEXT,
+            updated_at TEXT,
+            files INTEGER NOT NULL DEFAULT 0,
+            original_bytes INTEGER NOT NULL DEFAULT 0,
+            compressed_bytes INTEGER NOT NULL DEFAULT 0,
+            deduplicated_bytes INTEGER NOT NULL DEFAULT 0,
+            archive_name TEXT,
+            archive_id TEXT,
+            stats_recorded INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS jobs_kind_finished ON jobs(kind, finished_at DESC);
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
@@ -570,26 +709,49 @@ fn initialize(connection: &Connection) -> Result<()> {
             INSERT INTO files_fts(rowid, path) VALUES (new.id, new.path);
         END;",
     )?;
-    if !table_has_column(connection, "index_meta", "schema_version")? {
-        connection.execute(
+    if !table_has_column(&transaction, "index_meta", "schema_version")? {
+        transaction.execute(
             "ALTER TABLE index_meta ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
             [],
         )?;
     }
-    if !table_has_column(connection, "index_meta", "refresh_generation")? {
-        connection.execute(
+    if !table_has_column(&transaction, "index_meta", "refresh_generation")? {
+        transaction.execute(
             "ALTER TABLE index_meta ADD COLUMN refresh_generation INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
-    connection.execute(
+    for (column, definition) in [
+        ("phase", "TEXT"),
+        ("updated_at", "TEXT"),
+        ("files", "INTEGER NOT NULL DEFAULT 0"),
+        ("original_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("compressed_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("deduplicated_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("archive_name", "TEXT"),
+        ("archive_id", "TEXT"),
+        ("stats_recorded", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !table_has_column(&transaction, "jobs", column)? {
+            transaction.execute(
+                &format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute(
         "INSERT OR IGNORE INTO index_meta(
             singleton, schema_version, repository_id, repository_location,
             refresh_generation, refreshed_at, complete
          ) VALUES (1, ?1, NULL, NULL, 0, NULL, 0)",
         [INDEX_SCHEMA_VERSION],
     )?;
-    connection.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
+    transaction.execute(
+        "UPDATE index_meta SET schema_version = ?1 WHERE singleton = 1",
+        [INDEX_SCHEMA_VERSION],
+    )?;
+    transaction.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -602,6 +764,25 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
         }
     }
     Ok(false)
+}
+
+fn jobs_have_progress_columns(connection: &Connection) -> Result<bool> {
+    for column in [
+        "phase",
+        "updated_at",
+        "files",
+        "original_bytes",
+        "compressed_bytes",
+        "deduplicated_bytes",
+        "archive_name",
+        "archive_id",
+        "stats_recorded",
+    ] {
+        if !table_has_column(connection, "jobs", column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn archive_ids(transaction: &Transaction<'_>) -> Result<HashMap<String, String>> {
@@ -688,6 +869,37 @@ fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     })
 }
 
+fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
+    let state: String = row.get(2)?;
+    Ok(JobRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        state: match state.as_str() {
+            "succeeded" => JobState::Succeeded,
+            "failed" => JobState::Failed,
+            _ => JobState::Running,
+        },
+        started_at: parse_time(row.get::<_, String>(3)?, 3)?,
+        finished_at: row
+            .get::<_, Option<String>>(4)?
+            .map(|value| parse_time(value, 4))
+            .transpose()?,
+        message: row.get(5)?,
+        phase: row.get(6)?,
+        updated_at: row
+            .get::<_, Option<String>>(7)?
+            .map(|value| parse_time(value, 7))
+            .transpose()?,
+        files: nonnegative_u64(row.get(8)?, 8)?,
+        original_bytes: nonnegative_u64(row.get(9)?, 9)?,
+        compressed_bytes: nonnegative_u64(row.get(10)?, 10)?,
+        deduplicated_bytes: nonnegative_u64(row.get(11)?, 11)?,
+        archive_name: row.get(12)?,
+        archive_id: row.get(13)?,
+        stats_recorded: row.get::<_, i64>(14)? == 1,
+    })
+}
+
 fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveItem> {
     let kind: String = row.get(1)?;
     let size: i64 = row.get(2)?;
@@ -758,6 +970,10 @@ fn nonnegative_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
             Box::new(error),
         )
     })
+}
+
+fn sqlite_u64(value: u64) -> Result<i64> {
+    i64::try_from(value).context("backup progress exceeds SQLite integer range")
 }
 
 fn parse_time(value: String, column: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -907,6 +1123,96 @@ mod tests {
         assert_eq!(status.schema_version, INDEX_SCHEMA_VERSION);
         assert_eq!(status.refresh_generation, 0);
         assert!(!status.complete);
+    }
+
+    #[test]
+    fn read_only_status_accepts_legacy_job_rows_until_writable_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    message TEXT
+                 );
+                 INSERT INTO jobs(kind, state, started_at, finished_at)
+                 VALUES ('backup', 'succeeded',
+                         '2026-01-01T00:00:00+00:00', '2026-01-01T00:01:00+00:00');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let index = Index::open_read_only(&path).unwrap();
+        let job = index.last_success_job("backup").unwrap().unwrap();
+        assert_eq!(job.kind, "backup");
+        assert!(!job.stats_recorded);
+        assert_eq!(job.original_bytes, 0);
+    }
+
+    #[test]
+    fn historical_estimate_uses_median_successful_backup_duration() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = Index::open(temp.path().join("index.sqlite3")).unwrap();
+        let connection = index.connect().unwrap();
+        let base = DateTime::UNIX_EPOCH + chrono::Duration::days(1);
+        for (position, seconds) in [100, 200, 900].into_iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO jobs(kind, state, started_at, finished_at, updated_at)
+                     VALUES ('backup', 'succeeded', ?1, ?2, ?2)",
+                    params![
+                        (base + chrono::Duration::hours(position as i64)).to_rfc3339(),
+                        (base
+                            + chrono::Duration::hours(position as i64)
+                            + chrono::Duration::seconds(seconds))
+                        .to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO jobs(kind, state, started_at, finished_at, updated_at)
+                 VALUES ('backup', 'failed', ?1, ?2, ?2)",
+                params![
+                    base.to_rfc3339(),
+                    (base + chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(index.estimated_backup_seconds(5).unwrap(), Some(200));
+    }
+
+    #[test]
+    fn historical_estimate_requires_three_valid_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = Index::open(temp.path().join("index.sqlite3")).unwrap();
+        for _ in 0..2 {
+            let id = index.start_job("backup").unwrap();
+            index.finish_job(id, true, None).unwrap();
+        }
+        assert_eq!(index.estimated_backup_seconds(5).unwrap(), None);
+    }
+
+    #[test]
+    fn read_only_queries_do_not_wait_for_a_busy_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite3");
+        let index = Index::open(&path).unwrap();
+        let writer = index.connect().unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let reader = Index::open_read_only(&path).unwrap();
+        let started = std::time::Instant::now();
+
+        assert!(reader.status().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

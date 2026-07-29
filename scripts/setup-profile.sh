@@ -4,7 +4,7 @@ umask 077
 
 usage() {
   printf '%s\n' \
-    'Usage: setup-profile HOST CONFIG PASSPHRASE SSH_KEY KNOWN_HOSTS [MAINTENANCE_KEY|-] [BROWSE_USER]' >&2
+    'Usage: setup-profile HOST CONFIG PASSPHRASE SSH_KEY KNOWN_HOSTS [MAINTENANCE_KEY|-] [BROWSE_USER] [reconnect|new]' >&2
   exit 2
 }
 
@@ -23,14 +23,15 @@ install_private_dir() {
   fi
 }
 
-if [ "$#" -lt 5 ] || [ "$#" -gt 7 ]; then
+if [ "$#" -lt 5 ] || [ "$#" -gt 8 ]; then
   usage
 fi
 if [ "$(id -u)" -ne 0 ]; then
   printf '%s\n' 'Run this helper as root, directly or explicitly through pkexec.' >&2
   exit 1
 fi
-for executable in /usr/bin/boxup /usr/lib/boxup/boxup-root /usr/bin/systemd-analyze; do
+for executable in /usr/bin/boxup /usr/lib/boxup/boxup-root \
+  /usr/lib/boxup/setup-backup-sudo /usr/bin/systemd-analyze; do
   [ -x "$executable" ] || {
     printf 'Required executable is unavailable: %s\n' "$executable" >&2
     exit 1
@@ -48,6 +49,11 @@ ssh_key_source=${4:-}
 known_hosts_source=${5:-}
 maintenance_key_source=${6:--}
 browse_user=${7:-${PKEXEC_UID:-}}
+setup_mode=${8:-reconnect}
+case "$setup_mode" in
+  reconnect|new) ;;
+  *) usage ;;
+esac
 
 case "$profile" in
   ''|*[!A-Za-z0-9_-]*|[-_]*|*[-_]) printf '%s\n' 'Invalid profile name.' >&2; exit 1 ;;
@@ -55,6 +61,18 @@ esac
 case "$browse_user" in
   ''|-*|*[!A-Za-z0-9_.-]*) printf '%s\n' 'A valid browse user or PKEXEC_UID is required.' >&2; exit 1 ;;
 esac
+browse_user=$(getent passwd "$browse_user" | cut -d: -f1)
+case "$browse_user" in
+  ''|-*|*[!A-Za-z0-9_.-]*) printf '%s\n' 'The browse user could not be resolved safely.' >&2; exit 1 ;;
+esac
+[ "$(printf '%s' "$browse_user" | tr '[:lower:]' '[:upper:]')" != ALL ] || {
+  printf '%s\n' 'The reserved sudoers principal ALL cannot be a browse user.' >&2
+  exit 1
+}
+browse_uid=$(id -u "$browse_user")
+browse_gid=$(id -g "$browse_user")
+passwd_entry=$(getent passwd "$browse_user")
+browse_home=$(printf '%s\n' "$passwd_entry" | cut -d: -f6)
 
 for source in "$config_source" "$passphrase_source" "$ssh_key_source" "$known_hosts_source"; do
   if [ ! -f "$source" ] || [ -L "$source" ]; then
@@ -86,18 +104,30 @@ maintenance_key="/etc/boxup/${profile}_maintenance_ed25519"
 index_dir="/var/lib/boxup-index/$profile"
 index="$index_dir/index.sqlite3"
 lock="/var/lib/boxup/$profile/boxup.lock"
+validation_marker="/var/lib/boxup/$profile/requires-live-validation"
+setup_mode_file="/var/lib/boxup/$profile/setup-mode"
 dropin="/etc/systemd/system/boxup-backup-server@$profile.timer.d"
 schedule_file="$dropin/schedule.conf"
+sudoers_rule="/etc/sudoers.d/boxup-backup-$profile-$browse_uid"
 
 /usr/bin/boxup --config "$config_source" config validate \
   --system-profile "$system_config"
+credential_requirements=$(/usr/bin/boxup --config "$config_source" config credential-requirements)
+[ "$credential_requirements" = none ] || {
+  printf '%s\n' 'This setup helper does not install Discord webhook credentials; disable that profile option first.' >&2
+  exit 1
+}
 
-for target in "$system_config" "$passphrase" "$ssh_key" "$index" "$lock"; do
+for target in "$system_config" "$passphrase" "$ssh_key" "$index" "$lock" "$setup_mode_file" "$sudoers_rule"; do
   { [ ! -e "$target" ] && [ ! -L "$target" ]; } || {
     printf 'Target already exists; refusing to overwrite: %s\n' "$target" >&2
     exit 1
   }
 done
+if [ "$setup_mode" = reconnect ] && { [ -e "$validation_marker" ] || [ -L "$validation_marker" ]; }; then
+  printf 'Target already exists; refusing to overwrite: %s\n' "$validation_marker" >&2
+  exit 1
+fi
 if [ "$maintenance_key_source" != - ] && { [ -e "$maintenance_key" ] || [ -L "$maintenance_key" ]; }; then
   printf 'Target already exists; refusing to overwrite: %s\n' "$maintenance_key" >&2
   exit 1
@@ -127,10 +157,6 @@ fi
   exit 1
 }
 
-browse_uid=$(id -u "$browse_user")
-browse_gid=$(id -g "$browse_user")
-passwd_entry=$(getent passwd "$browse_user")
-browse_home=$(printf '%s\n' "$passwd_entry" | cut -d: -f6)
 case "$browse_home" in
   /*) ;;
   *) printf '%s\n' 'Browse user has no absolute home directory.' >&2; exit 1 ;;
@@ -160,6 +186,12 @@ for directory in /etc/boxup /var/lib/boxup /var/cache/boxup \
   "$index_dir"; do
   install_private_dir "$directory"
 done
+if [ "$setup_mode" = reconnect ]; then
+  install -m 0600 -o root -g root /dev/null "$validation_marker"
+fi
+printf '%s\n' "$setup_mode" >"$setup_mode_file"
+chmod 0600 "$setup_mode_file"
+chown root:root "$setup_mode_file"
 install -m 0600 -o root -g root "$config_source" "$system_config"
 install -m 0600 -o root -g root "$passphrase_source" "$passphrase"
 install -m 0600 -o root -g root "$ssh_key_source" "$ssh_key"
@@ -174,6 +206,7 @@ fi
 
 /usr/lib/boxup/boxup-root --config "$system_config" validate-config
 /usr/lib/boxup/boxup-root --config "$system_config" prepare
+/usr/lib/boxup/setup-backup-sudo "$profile" "$browse_user"
 setfacl -m "u:$browse_uid:--x" /var/lib/boxup-index
 setfacl -m "u:$browse_uid:--x" "$index_dir"
 setfacl -m "u:$browse_uid:r--" "$index"
@@ -223,4 +256,4 @@ esac
 printf 'Created root profile and credentials for %s.\n' "$profile"
 printf 'Created secret-free read-only browse descriptor for %s at %s.\n' "$browse_user" "$browse_config"
 printf 'Configured schedule uses %s; review it before enabling that unit.\n' "$timer_unit"
-printf '%s\n' 'No repository was initialized, no timer was enabled, and systemd was not reloaded.'
+printf 'Setup mode is %s. No repository was initialized, no timer was enabled, and systemd was not reloaded.\n' "$setup_mode"

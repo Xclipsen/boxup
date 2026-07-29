@@ -17,10 +17,12 @@ done
 
 for unit in "$project_dir"/packaging/systemd/*.service; do
   case "$(basename "$unit")" in
+    boxup-notify@.service) continue ;;
     boxup-backup-now@.service) operation=backup ;;
     boxup-backup-due@.service) operation=due ;;
     boxup-maintenance@.service) operation=maintenance ;;
     boxup-check@.service) operation=check ;;
+    boxup-index@.service) operation=index-refresh ;;
     *) printf 'Unexpected service: %s\n' "$unit" >&2; exit 1 ;;
   esac
   grep -Fqx "ExecStart=/usr/lib/boxup/boxup-root --config /etc/boxup/%i.toml $operation" "$unit"
@@ -44,13 +46,19 @@ for unit in "$project_dir"/packaging/systemd/*.service; do
     backup|due)
       expected='ReadWritePaths=/var/lib/boxup/%i /var/cache/boxup/%i /var/lib/boxup-index/%i /var/lib/boxup-docker/%i'
       ;;
-    maintenance|check)
+    maintenance|check|index-refresh)
       expected='ReadWritePaths=/var/lib/boxup/%i /var/cache/boxup/%i /var/lib/boxup-index/%i'
       ;;
   esac
   grep -Fqx "$expected" "$unit"
   install -m644 "$unit" "$unit_dir/$(basename "$unit")"
 done
+grep -Fqx 'ExecStart=/usr/bin/boxup --browse-config=%h/.config/boxup/%i-browse.toml notify --watch --state-file=%t/boxup/%i-notified-job' \
+  "$project_dir/packaging/systemd/boxup-notify@.service"
+grep -Fqx 'NoNewPrivileges=yes' "$project_dir/packaging/systemd/boxup-notify@.service"
+grep -Fqx 'ProtectSystem=strict' "$project_dir/packaging/systemd/boxup-notify@.service"
+grep -Fqx 'RestrictAddressFamilies=AF_UNIX' \
+  "$project_dir/packaging/systemd/boxup-notify@.service"
 for unit in "$project_dir"/packaging/systemd/*.timer; do
   install -m644 "$unit" "$unit_dir/$(basename "$unit")"
 done
@@ -67,5 +75,15 @@ grep -Fqx 'Unit=boxup-backup-due@%i.service' \
   "$project_dir/packaging/systemd/boxup-backup-desktop@.timer"
 grep -Fqx 'Unit=boxup-backup-now@%i.service' \
   "$project_dir/packaging/systemd/boxup-backup-server@.timer"
+grep -Fqx 'OnBootSec=15min' \
+  "$project_dir/packaging/systemd/boxup-index@.timer"
+grep -Fqx 'OnUnitActiveSec=6h' \
+  "$project_dir/packaging/systemd/boxup-index@.timer"
+grep -Fqx 'RandomizedDelaySec=15min' \
+  "$project_dir/packaging/systemd/boxup-index@.timer"
+grep -Fqx 'Persistent=true' \
+  "$project_dir/packaging/systemd/boxup-index@.timer"
+grep -Fqx 'Unit=boxup-index@%i.service' \
+  "$project_dir/packaging/systemd/boxup-index@.timer"
 
 systemd-analyze --root="$root" verify "$unit_dir"/*.service "$unit_dir"/*.timer

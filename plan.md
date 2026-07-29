@@ -11,6 +11,10 @@ bewusst ausserhalb der TUI.
 
 Die TUI bietet derzeit:
 
+- ein lokales Backup-Dashboard mit letztem Erfolg, Faelligkeit, Indexzustand und
+  Jobhistorie;
+- manuelle Vordergrund-Backups ueber den festen Root-Helper mit Phase,
+  sicheren Borg-Zaehlern und historischer ETA;
 - Snapshot-Browsing aus dem lokalen SQLite-Index;
 - Navigation durch direkte Verzeichniseintraege;
 - Filterung des aktuell sichtbaren Verzeichnisses;
@@ -173,15 +177,16 @@ Abnahmekriterien:
   platziert.
 - Kleine Terminals erhalten kompakte Layouts statt abgeschnittener Dialoge.
 
-### 11. Manueller Backup-Job
+### 11. Manueller Backup-Job (Grundlage umgesetzt)
 
 - Einen normalen Backup-Lauf aus der TUI starten.
 - Aktuelle Phase, Dauer und sichere Fortschrittsdaten anzeigen.
 - Parallele Backup-Laeufe durch die bestehende Sperre verhindern.
 - Nach Erfolg Status und Index kontrolliert aktualisieren.
 
-Diese Funktion folgt erst nach den lesenden und Restore-bezogenen Funktionen,
-weil sie Remote-Schreibzugriff ausloest und mehr Betriebszustaende abbilden muss.
+Die sichere Grundfunktion ist umgesetzt. Weitere TUI-Arbeiten muessen den festen
+Root-Helper, die bestehende Sperre, sichere Abbruchgrenzen und die klare Trennung
+von lokalem Status und Live-Repository-Daten beibehalten.
 
 ## Bewusst nicht in der TUI
 
@@ -208,7 +213,7 @@ Sicherheitsgewinn bieten.
 - Abbruch nur in eindeutig sicheren Phasen erlauben; Publikation nicht mitten in
   einer atomaren Ersetzung unterbrechen.
 - Fehlerausgaben zentral bereinigen und scrollbar speichern.
-- Bestehende shellfreie Borg-, SSH-, pkexec- und Mount-Ausfuehrung beibehalten.
+- Bestehende shellfreie Borg-, SSH-, sudo-, pkexec- und Mount-Ausfuehrung beibehalten.
 
 ## Tests
 

@@ -25,4 +25,15 @@
     <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/boxup/setup-profile</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">false</annotate>
   </action>
+  <action id="org.boxup.setup-automation">
+    <description>Enable or disable Boxup backup automation</description>
+    <message>Authentication is required to change Boxup backup automation</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/boxup/setup-automation</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">false</annotate>
+  </action>
 </policyconfig>

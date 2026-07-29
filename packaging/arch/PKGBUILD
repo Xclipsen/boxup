@@ -1,18 +1,18 @@
 # Maintainer: Xclipsen <101043764+Xclipsen@users.noreply.github.com>
 pkgname=boxup
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Policy-focused Borg 1.4 backup frontend'
 arch=('x86_64' 'aarch64')
 license=('MIT')
 url='https://github.com/Xclipsen/boxup'
-depends=('acl' 'borg>=1.4' 'curl' 'fuse3' 'openssh' 'polkit' 'python' 'python-pyfuse3' 'rsync' 'sqlite' 'systemd')
+depends=('acl' 'bash-completion' 'borg>=1.4' 'curl' 'fuse3' 'libnotify' 'openssh' 'polkit' 'python' 'python-pyfuse3' 'rsync' 'sqlite' 'sudo' 'systemd')
 optdepends=('docker: Docker consistency snapshots')
 makedepends=('rust>=1.85')
 options=('!debug')
 install=boxup.install
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('2bb1eb6247268dc736e387bfdd14bf58f44e46648f64d797025f838040b3b028')
+sha256sums=('94124e48f00e2e5387ab39e693a2e566c98f1e0ec403d462bf7090ee56c9576a')
 
 prepare() {
   cd "$pkgname-$pkgver"
@@ -30,6 +30,7 @@ build() {
 check() {
   cd "$pkgname-$pkgver"
   cargo test --frozen --offline
+  sh tests/setup-automation.sh
 }
 
 package() {
@@ -37,13 +38,22 @@ package() {
   install -Dm755 target/release/boxup "$pkgdir/usr/bin/boxup"
   install -Dm755 target/release/boxup-root "$pkgdir/usr/lib/boxup/boxup-root"
   install -Dm755 scripts/setup-profile.sh "$pkgdir/usr/lib/boxup/setup-profile"
+  install -Dm755 scripts/setup-backup-sudo.sh "$pkgdir/usr/lib/boxup/setup-backup-sudo"
+  install -Dm755 scripts/setup-automation.sh "$pkgdir/usr/lib/boxup/setup-automation"
+  install -Dm644 completions/boxup.bash "$pkgdir/usr/share/bash-completion/completions/boxup"
+  install -Dm644 completions/_boxup "$pkgdir/usr/share/zsh/site-functions/_boxup"
+  install -Dm644 completions/boxup.fish "$pkgdir/usr/share/fish/vendor_completions.d/boxup.fish"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/boxup/LICENSE"
   install -Dm644 vendor/THIRD_PARTY_NOTICES \
     "$pkgdir/usr/share/licenses/boxup/THIRD_PARTY_NOTICES"
   install -Dm644 packaging/polkit/org.boxup.policy \
     "$pkgdir/usr/share/polkit-1/actions/org.boxup.policy"
   install -d "$pkgdir/usr/lib/systemd/system"
-  install -m644 packaging/systemd/* "$pkgdir/usr/lib/systemd/system/"
+  install -m644 packaging/systemd/*.service packaging/systemd/*.timer \
+    "$pkgdir/usr/lib/systemd/system/"
+  install -Dm644 packaging/systemd/boxup-notify@.service \
+    "$pkgdir/usr/lib/systemd/user/boxup-notify@.service"
+  rm -f "$pkgdir/usr/lib/systemd/system/boxup-notify@.service"
   install -Dm644 examples/desktop.toml "$pkgdir/usr/share/doc/boxup/examples/desktop.toml"
   install -Dm644 examples/ubuntu-docker-vps.toml \
     "$pkgdir/usr/share/doc/boxup/examples/ubuntu-docker-vps.toml"

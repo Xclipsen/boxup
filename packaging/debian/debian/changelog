@@ -1,5 +1,7 @@
-boxup (0.1.0-1) unstable; urgency=medium
+boxup (0.2.0-1) unstable; urgency=medium
 
-  * Initial package.
+  * Add the backup dashboard, foreground progress, and safe-copy restore.
+  * Add independent background indexing, automation setup, and notifications.
+  * Improve cancellation, packaging, completions, and recovery guidance.
 
- -- Xclipsen <101043764+Xclipsen@users.noreply.github.com>  Wed, 22 Jul 2026 00:00:00 +0000
+ -- Xclipsen <101043764+Xclipsen@users.noreply.github.com>  Wed, 29 Jul 2026 00:00:00 +0000

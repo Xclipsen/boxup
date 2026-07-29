@@ -12,6 +12,7 @@ override_dh_auto_build:
 
 override_dh_auto_test:
 	CARGO_NET_OFFLINE=true cargo test --frozen --offline
+	sh tests/setup-automation.sh
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
@@ -20,10 +21,17 @@ override_dh_auto_install:
 	install -Dm755 target/release/boxup debian/boxup/usr/bin/boxup
 	install -Dm755 target/release/boxup-root debian/boxup/usr/lib/boxup/boxup-root
 	install -Dm755 scripts/setup-profile.sh debian/boxup/usr/lib/boxup/setup-profile
+	install -Dm755 scripts/setup-backup-sudo.sh debian/boxup/usr/lib/boxup/setup-backup-sudo
+	install -Dm755 scripts/setup-automation.sh debian/boxup/usr/lib/boxup/setup-automation
+	install -Dm644 completions/boxup.bash debian/boxup/usr/share/bash-completion/completions/boxup
+	install -Dm644 completions/_boxup debian/boxup/usr/share/zsh/vendor-completions/_boxup
+	install -Dm644 completions/boxup.fish debian/boxup/usr/share/fish/vendor_completions.d/boxup.fish
 	install -Dm644 LICENSE debian/boxup/usr/share/doc/boxup/LICENSE
 	install -Dm644 vendor/THIRD_PARTY_NOTICES debian/boxup/usr/share/doc/boxup/THIRD_PARTY_NOTICES
 	install -d debian/boxup/usr/lib/systemd/system
-	install -m644 packaging/systemd/* debian/boxup/usr/lib/systemd/system/
+	install -m644 packaging/systemd/*.service packaging/systemd/*.timer debian/boxup/usr/lib/systemd/system/
+	install -Dm644 packaging/systemd/boxup-notify@.service debian/boxup/usr/lib/systemd/user/boxup-notify@.service
+	rm -f debian/boxup/usr/lib/systemd/system/boxup-notify@.service
 	install -Dm644 packaging/polkit/org.boxup.policy debian/boxup/usr/share/polkit-1/actions/org.boxup.policy
 	install -Dm644 examples/desktop.toml debian/boxup/usr/share/doc/boxup/examples/desktop.toml
 	install -Dm644 examples/ubuntu-docker-vps.toml debian/boxup/usr/share/doc/boxup/examples/ubuntu-docker-vps.toml

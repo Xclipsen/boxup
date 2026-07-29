@@ -1,0 +1,26 @@
+[Unit]
+Description=Show Boxup desktop backup notifications for %i
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/boxup --browse-config=%h/.config/boxup/%i-browse.toml notify --watch --state-file=%t/boxup/%i-notified-job
+Restart=on-failure
+RestartSec=10s
+RuntimeDirectory=boxup
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

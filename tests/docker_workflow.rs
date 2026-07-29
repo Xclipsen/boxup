@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use boxup::backend::{Backend, DiffStream, FileStream};
 use boxup::config::*;
-use boxup::domain::{CreateRequest, RepositoryIdentity, Snapshot, utc_now};
+use boxup::domain::{BackupResult, CreateRequest, RepositoryIdentity, Snapshot, utc_now};
 use boxup::index::Index;
 use boxup::jobs::{DockerManager, JobRunner};
 
@@ -834,15 +834,18 @@ impl Backend for RecordingBackend {
         bail!("unexpected file listing")
     }
 
-    async fn create(&self, request: &CreateRequest) -> Result<Snapshot> {
+    async fn create(&self, request: &CreateRequest) -> Result<BackupResult> {
         *self.request.lock().unwrap() = Some(request.clone());
-        Ok(Snapshot {
-            id: "c".repeat(64),
-            name: request.archive_name.clone(),
-            start: utc_now(),
-            end: Some(utc_now()),
-            hostname: Some("test".into()),
-            username: Some("tester".into()),
+        Ok(BackupResult {
+            snapshot: Snapshot {
+                id: "c".repeat(64),
+                name: request.archive_name.clone(),
+                start: utc_now(),
+                end: Some(utc_now()),
+                hostname: Some("test".into()),
+                username: Some("tester".into()),
+            },
+            notes: Vec::new(),
         })
     }
 

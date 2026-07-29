@@ -50,7 +50,7 @@ path = "/var/lib/boxup-index/desktop/index.sqlite3"
 
 [schedule]
 mode = "due"
-due_hours = 20
+due_hours = 24
 
 [notifications]
 enabled = false

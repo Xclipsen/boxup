@@ -24,6 +24,29 @@ An existing repository must never be initialized again.
 See [Restore And Recovery](docs/RESTORE.md) before reinstalling a machine or
 moving an existing profile.
 
+## Everyday Use
+
+Run `boxup` without arguments. It opens the English terminal application with a
+small numbered menu:
+
+```text
+1 Back up now   2 Restore files   3 Browse backups
+4 Settings/details   5 Toggle automation   Q Quit
+```
+
+The normal dashboard uses plain states such as `Protected`, `Backing up`,
+`Needs attention`, `Backup failed`, and `Automatic backups off`. Repository,
+index, and Borg details stay behind the settings/details view. While a foreground
+or scheduled backup is active, the dashboard shows its current phase, elapsed
+time, processed files and bytes, newly stored data, and last progress update.
+
+When no profile is installed, `boxup` starts a guided wizard for reconnecting an
+existing repository from its exact recovered profile. It asks only for profile
+and credential file paths, never secret contents. The wizard preserves the old
+host ID, repository, sources, exclusions, and schedule; it never initializes a
+repository and leaves automation off until live read-only validation, a safe-copy
+restore, and a deliberate backup have succeeded.
+
 ## Install
 
 Boxup requires Rust 1.85 or newer when building from source. Installed packages
@@ -80,6 +103,9 @@ restrict,command="borg-1.4 serve --append-only --restrict-to-repository /home/BA
 
 ## Create A Profile
 
+For the guided existing-repository flow, run `boxup setup`. The manual expert
+flow remains available below.
+
 Choose a short host ID such as `desktop`. The filename and `host.id` must match.
 
 ```sh
@@ -91,13 +117,31 @@ After editing and reviewing the profile, install it with the fixed setup helper:
 ```sh
 pkexec /usr/lib/boxup/setup-profile \
   desktop desktop.toml desktop.passphrase desktop_ed25519 \
-  known_hosts desktop_maintenance_ed25519 YOUR_USER
+  known_hosts desktop_maintenance_ed25519 YOUR_USER reconnect
 ```
 
 When automatic prune is not wanted, remove `maintenance_ssh_key` from the TOML
 profile and use `-` instead of the maintenance-key argument. The helper creates
 root-only credentials and a secret-free browse descriptor for the selected user.
 It still does not initialize anything or enable timers.
+
+The setup also installs one exact sudoers rule for that user and profile. It
+permits only this passwordless command:
+
+```text
+/usr/lib/boxup/boxup-root --config /etc/boxup/HOST.toml backup --progress-json
+```
+
+It does not grant passwordless access to `boxup`, restore, initialization,
+maintenance, checks, key export, or arbitrary root commands. Existing profiles
+created before this feature need one explicit administrative migration:
+
+```sh
+sudo /usr/lib/boxup/setup-backup-sudo HOST BROWSE_USER
+```
+
+That migration can require authentication once. Afterwards, `boxup backup` and
+the TUI `B` action use `sudo -n` and never display a password prompt.
 
 ## New Repository
 
@@ -114,6 +158,8 @@ exact profile outside both the source machine and the repository. Test that the
 recovery copy can be decrypted before relying on the backup.
 
 Skip this entire section when reconnecting an existing repository.
+For a separately verified new deployment, install its profile with `new` instead
+of `reconnect`; only that explicit setup mode permits the later `boxup init`.
 
 ## First Backup
 
@@ -125,12 +171,35 @@ boxup status
 boxup snapshots --live
 ```
 
-Then refresh the local browsing index and perform a real restore test:
+Manual `boxup backup` runs in the foreground and reports its current phase,
+elapsed time, processed files and bytes, throughput, and newly deduplicated data.
+After three successful runs it also shows a clearly approximate progress bar and
+ETA based on the median duration of recent successful backups. Borg does not
+provide a total input size while creating an archive, so Boxup does not claim an
+exact percentage and does not pre-scan every source. Current source paths are
+never included in progress output.
+
+For an installed system profile, the foreground command uses the fixed
+privileged helper. Scheduled backups continue to use the sandboxed systemd
+services. A manual foreground run is terminal-coupled and does not inherit the
+service unit's resource limits or sandbox. Pressing Ctrl-C requests cancellation;
+Boxup defers it while configured
+containers or services are quiesced and records the interrupted run as failed
+after application data is safely resumed.
+
+After the independent browsing index has refreshed, confirm its freshness and
+perform a real restore test:
 
 ```sh
-boxup --config /etc/boxup/desktop.toml index refresh
+boxup status
 boxup ls desktop-ARCHIVE home/YOUR_USER/Documents --live
 ```
+
+Backups do not wait for the file browsing index to refresh. The independent
+`boxup-index@HOST.timer` updates that cache in the background when enabled. You
+can also run `boxup index refresh` explicitly. When a single installed browse
+descriptor is discovered, it automatically delegates to its matching system
+profile.
 
 Do not retire an older backup system until a complete Boxup backup, repository
 check, and representative restore have all succeeded.
@@ -148,9 +217,11 @@ pkexec /usr/bin/boxup --config /etc/boxup/desktop.toml restore \
 Inspect the restored files before copying selected data into the live system.
 Avoid restoring an entire old `.config` over a fresh desktop installation.
 
-The terminal browser can deliberately restore a selected file or directory to
-its archived absolute path. Run `boxup tui`, select entries with Space, press
-`R`, review the displayed `/...` targets, and type `RESTORE`. For example, the
+The terminal browser asks whether to restore a safe copy or replace the original
+path. Safe copy is the default and publishes into a new root-owned directory
+under `/var/lib/boxup-recovery/HOST`. Original replacement remains an advanced
+choice: select entries with Space, press `R`, choose replacement, review the
+displayed `/...` targets, and type `RESTORE`. For example, the
 archive path `home/alice/.config/hypr` exactly replaces
 `/home/alice/.config/hypr`; files present only in the current directory are
 removed. The TUI displays live validation, Borg extraction, verification, and
@@ -168,8 +239,22 @@ rehearsals, and emergency restore behavior.
 
 ## Enable Scheduling
 
-Desktop profiles use a due-based timer, suitable for machines that are not always
-online. Server profiles use a calendar timer.
+After a successful first backup and restore rehearsal, enable daily backups,
+six-hour background indexing, and per-backup desktop notifications together:
+
+```sh
+boxup automation enable
+boxup automation status
+```
+
+Use `boxup automation disable` to stop unattended repository writes and
+background index reads.
+The desktop notification watcher starts with the user's next login. Desktop
+profiles use a due-based timer, suitable for machines that are not always online;
+with the friendly default, one backup becomes due every 24 hours and is started
+after the computer is next available. Server profiles use a calendar timer.
+
+The equivalent expert-level units are:
 
 ```sh
 # Desktop profile
@@ -181,14 +266,24 @@ sudo systemctl enable --now boxup-backup-server@HOST.timer
 # Optional after successful recovery verification
 sudo systemctl enable --now boxup-maintenance@HOST.timer
 sudo systemctl enable --now boxup-check@HOST.timer
+
+# Optional independent background index refresh
+sudo systemctl enable --now boxup-index@HOST.timer
 ```
 
 Enable only the backup timer matching the profile schedule. Maintenance requires
 a configured key with delete access and therefore weakens append-only protection.
+The index timer starts after boot and refreshes every six hours with a randomized
+delay. Packages install all timers disabled. `boxup automation enable` selects
+exactly the backup timer matching the profile and enables the index timer; it
+never enables maintenance or repository checks.
 
 ## Common Commands
 
 ```text
+boxup
+boxup setup
+boxup automation enable|disable|status
 boxup backup
 boxup status [--json]
 boxup snapshots [--json] [--live]
@@ -204,10 +299,32 @@ boxup index refresh
 boxup tui
 ```
 
-The SQLite index is only a browsing cache. Restore, retention, initialization,
-and repository checks use live Borg data.
+`boxup status` reports the last fully successful Boxup workflow, its archive,
+duration and final Borg statistics, the next due time, the latest attempt,
+active or stale jobs, recent job history, historical duration estimate, and
+local index freshness. This command reads local cached state and does not contact
+the repository; use `boxup snapshots --live` for live validation.
 
-The TUI supports Yazi-style navigation: `j`/`k` move down/up, `l` opens a
+Installed packages provide Bash, Zsh, and Fish completions. Start a new shell
+after package installation, then commands and nested commands such as
+`boxup index refresh`, `boxup config validate`, and `boxup key export` complete
+with Tab. Bash completion is installed as a runtime dependency.
+
+The SQLite index is an untrusted browsing cache. The optional index timer keeps it
+synchronized independently from backups. An index refresh performs read-only
+repository access aside from writes to local cache and index state. Restore,
+retention, initialization, and repository checks use live Borg data rather than
+trusting SQLite.
+
+The terminal app opens on a simple local-status dashboard. Numbered actions start
+a backup, open the restore flow, browse snapshots, reveal technical details, or
+toggle automation. The dashboard remains available when the index is stale or
+incomplete, while browsing stays denied. A known Borg warning that files changed
+while being read and configured folders that are currently absent are recorded
+as a successful backup with notes; unknown, permission, skipped-file, and
+repository warnings remain failures. Failed
+foreground backups display a bounded sanitized message in a wrapped dialog.
+The browser supports Yazi-style navigation: `j`/`k` move down/up, `l` opens a
 directory or enters the file pane, and `h` goes to the parent directory or back
 to the snapshot pane. Arrow keys, Enter, Backspace, Home, and End remain
 available. `/` filters only the directly visible entries in the currently open

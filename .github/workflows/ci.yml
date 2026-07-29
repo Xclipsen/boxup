@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - run: pacman -Syu --noconfirm base-devel git rust borg openssh polkit python-pyfuse3 rsync
+      - run: pacman -Syu --noconfirm acl base-devel bash-completion borg curl fuse3 git libnotify openssh polkit python-pyfuse3 rsync rust sqlite sudo systemd
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: useradd --create-home builder && chown -R builder:builder .
       - run: su builder -c 'cargo test --locked'

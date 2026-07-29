@@ -57,13 +57,20 @@ The generated `STATE/inventory/ARCHIVE.json` follows the same rule: it may be
 selected from an archive and restored to a safe external destination, while the
 live Boxup state directory remains protected as a restore destination.
 
+The terminal app makes this safe-copy flow the default. Its fixed root helper
+publishes only to a newly generated direct child of
+`/var/lib/boxup-recovery/HOST`, such as `restore-20260728T201500Z`. The helper
+derives `HOST` from the validated system profile, creates only root-owned
+mode-0700 non-symlink parents, and refuses arbitrary or existing destinations.
+Use the displayed path to inspect the result before copying selected files back.
+
 ## Interactive Original-Path Restore
 
 The TUI provides an explicit exact-replacement workflow for selected paths from
 a `/etc/boxup/*.toml` system profile:
 
 1. Select a snapshot and one or more files or directories with Space.
-2. Press `R` and review every absolute destination shown by the TUI.
+2. Press `R`, choose `Replace original files`, and review every absolute target.
 3. Type exactly `RESTORE` and press Enter.
 4. Keep the machine powered on while validation, extraction, verification, and
    publication progress is displayed.

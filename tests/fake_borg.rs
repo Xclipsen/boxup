@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use boxup::borg::{BorgExit, BorgRunner};
 use boxup::config::*;
@@ -280,7 +281,8 @@ case "${1:-}:${2:-}" in
       case "$argument" in ::*) archive=${argument#::} ;; esac
     done
     [ -n "$archive" ]
-    printf '{"archive":{"id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"%s","start":"2026-07-22T04:00:00.123456","end":"2026-07-22T04:01:00.654321","hostname":"test","username":"root"}}\n' "$archive"
+    printf '%s\n' '{"type":"archive_progress","finished":false,"nfiles":7,"original_size":4096,"compressed_size":2048,"deduplicated_size":1024,"path":"must/not/escape"}' >&2
+    printf '{"archive":{"id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"%s","start":"2026-07-22T04:00:00.123456","end":"2026-07-22T04:01:00.654321","hostname":"test","username":"root","stats":{"nfiles":7,"original_size":4096,"compressed_size":2048,"deduplicated_size":1024}}}\n' "$archive"
     ;;
   info:--json) printf '%s\n' '__REPOSITORY_LIST__' ;;
   list:--json) printf '%s\n' '__REPOSITORY_LIST__' ;;
@@ -302,8 +304,9 @@ esac
     let backend = BorgBackend::new(&config);
     let index = Index::open(&config.index.path).unwrap();
 
+    let progress = Mutex::new(Vec::new());
     let snapshot = JobRunner::new(&config, &backend, &index)
-        .backup()
+        .backup_with_progress(|event| progress.lock().unwrap().push(event))
         .await
         .unwrap();
     assert_eq!(snapshot.id, "c".repeat(64));
@@ -316,6 +319,223 @@ esac
     )
     .unwrap();
     assert_eq!(stamp["archive_id"], "c".repeat(64));
+    let progress = progress.into_inner().unwrap();
+    assert!(progress.iter().any(|event| {
+        event.phase == boxup::domain::BackupPhase::CreatingArchive
+            && event.files == 7
+            && event.original_bytes == 4096
+            && event.deduplicated_bytes == 1024
+    }));
+    assert_eq!(
+        progress.last().unwrap().phase,
+        boxup::domain::BackupPhase::Complete
+    );
+    let job = index.recent_jobs(1).unwrap().pop().unwrap();
+    assert_eq!(job.archive_name.as_deref(), Some(snapshot.name.as_str()));
+    assert_eq!(job.archive_id.as_deref(), Some(snapshot.id.as_str()));
+    assert_eq!(
+        (job.files, job.original_bytes, job.compressed_bytes),
+        (7, 4096, 2048)
+    );
+}
+
+#[tokio::test]
+async fn create_file_changed_warning_completes_backup_with_note() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("fake-borg");
+    let archive_name = temp.path().join("created-archive");
+    write_executable(
+        &script,
+        &r#"#!/bin/sh
+set -eu
+cat >/dev/null
+case "${1:-}:${2:-}" in
+  create:--json)
+    archive=
+    for argument in "$@"; do
+      case "$argument" in ::*) archive=${argument#::} ;; esac
+    done
+    printf '%s\n' "$archive" >'__ARCHIVE_NAME__'
+    printf '%s\n' '{"type":"log_message","levelname":"WARNING","message":"file changed while we backed it up","msgid":"BackupRaceCondition"}' >&2
+    printf '{"archive":{"id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"%s","start":"2026-07-22T04:00:00Z"}}\n' "$archive"
+    exit 100
+    ;;
+  info:--json) printf '%s\n' '__REPOSITORY_LIST__' ;;
+  list:--json)
+    archive=$(cat '__ARCHIVE_NAME__')
+    printf '{"archives":[{"id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"%s","start":"2026-07-22T04:00:00Z"}]}\n' "$archive"
+    ;;
+  list:--json-lines) printf '%s\n' '{"path":"safe/file","type":"file","size":4}' ;;
+  *) exit 2 ;;
+esac
+"#
+        .replace("__ARCHIVE_NAME__", &archive_name.display().to_string())
+        .replace(
+            "__REPOSITORY_LIST__",
+            include_str!("fixtures/repository-list.json"),
+        ),
+    );
+    let config = fake_config(temp.path(), script);
+    fs::create_dir(temp.path().join("source")).unwrap();
+    let backend = BorgBackend::new(&config);
+    let index = Index::open(&config.index.path).unwrap();
+
+    let before = boxup::domain::utc_now();
+    let backup = JobRunner::new(&config, &backend, &index)
+        .backup()
+        .await
+        .unwrap();
+    assert_eq!(
+        backup.notes,
+        vec![boxup::domain::BackupNote::FilesChangedWhileBeingRead]
+    );
+    assert_eq!(backup.id, "c".repeat(64));
+    let job = index.latest_job("backup").unwrap().unwrap();
+    assert_eq!(job.state, boxup::domain::JobState::Succeeded);
+    assert_eq!(job.archive_name.as_deref(), Some(backup.name.as_str()));
+    assert_eq!(job.archive_id.as_deref(), Some(backup.id.as_str()));
+    assert_eq!(
+        job.message.as_deref(),
+        Some("Completed with note: files changed while being read")
+    );
+    assert!(index.last_success("backup").unwrap().unwrap() >= before);
+
+    let stamp: serde_json::Value = serde_json::from_slice(
+        &fs::read(config.backup.state_dir.join("last-success.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stamp["archive"], backup.name);
+    assert_eq!(stamp["archive_id"], backup.id);
+    assert!(!index.status().unwrap().complete);
+    assert!(index.snapshots().unwrap().is_empty());
+    assert!(
+        JobRunner::new(&config, &backend, &index)
+            .backup_if_due()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(index.recent_jobs(10).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_other_warning_codes_remain_errors() {
+    for code in [1, 104] {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-borg");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+set -eu
+cat >/dev/null
+archive=
+for argument in "$@"; do
+  case "$argument" in ::*) archive=${{argument#::}} ;; esac
+done
+printf '%s\n' '{{"type":"log_message","levelname":"WARNING","message":"structured warning","msgid":"Warning"}}' >&2
+printf '{{"archive":{{"id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"%s","start":"2026-07-22T04:00:00Z"}}}}\n' "$archive"
+exit {code}
+"#
+            ),
+        );
+        let config = fake_config(temp.path(), script);
+        fs::create_dir(temp.path().join("source")).unwrap();
+        let backend = BorgBackend::new(&config);
+        let request = CreateRequest {
+            archive_name: format!("test-warning-{code}"),
+            sources: config.backup.sources.clone(),
+            excludes: Vec::new(),
+            one_file_system: true,
+            exclude_caches: true,
+            compression: "lz4".into(),
+            upload_rate_kib: None,
+        };
+
+        let error = backend.create(&request).await.unwrap_err();
+        assert!(format!("{error:#}").contains("structured warning"));
+    }
+}
+
+#[tokio::test]
+async fn create_code_100_requires_a_valid_expected_archive() {
+    for output in [
+        "{}",
+        r#"{"archive":{"id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","name":"wrong-name","start":"2026-07-22T04:00:00Z"}}"#,
+        r#"{"archive":{"id":"not-an-archive-id","name":"test-warning","start":"2026-07-22T04:00:00Z"}}"#,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-borg");
+        write_executable(
+            &script,
+            &r#"#!/bin/sh
+set -eu
+cat >/dev/null
+printf '%s\n' '__OUTPUT__'
+exit 100
+"#
+            .replace("__OUTPUT__", output),
+        );
+        let config = fake_config(temp.path(), script);
+        fs::create_dir(temp.path().join("source")).unwrap();
+        let backend = BorgBackend::new(&config);
+        let request = CreateRequest {
+            archive_name: "test-warning".into(),
+            sources: config.backup.sources.clone(),
+            excludes: Vec::new(),
+            one_file_system: true,
+            exclude_caches: true,
+            compression: "lz4".into(),
+            upload_rate_kib: None,
+        };
+
+        assert!(backend.create(&request).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn create_cancellation_reaps_the_borg_process_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("fake-borg");
+    write_executable(
+        &script,
+        r#"#!/bin/sh
+set -eu
+cat >/dev/null
+trap 'exit 130' INT TERM
+case "${1:-}:${2:-}" in
+  create:--json) while :; do sleep 1; done ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    let config = fake_config(temp.path(), script);
+    fs::create_dir(temp.path().join("source")).unwrap();
+    let backend = BorgBackend::new(&config);
+    let request = CreateRequest {
+        archive_name: "test-cancel".into(),
+        sources: config.backup.sources.clone(),
+        excludes: Vec::new(),
+        one_file_system: true,
+        exclude_caches: true,
+        compression: "lz4".into(),
+        upload_rate_kib: None,
+    };
+    let (progress, _progress_receiver) =
+        tokio::sync::watch::channel(boxup::domain::CreateProgress::default());
+    let (cancel, cancel_receiver) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = cancel.send(true);
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        backend.create_with_progress(&request, progress, cancel_receiver),
+    )
+    .await
+    .expect("cancelled Borg did not exit in time");
+    assert!(format!("{:#}", result.unwrap_err()).contains("cancelled"));
 }
 
 #[tokio::test]

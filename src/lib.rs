@@ -7,6 +7,7 @@ pub mod domain;
 pub mod index;
 pub mod jobs;
 pub mod restore;
+pub mod setup;
 pub mod tui;
 
 pub use backend::{Backend, DiffStream, FileStream};

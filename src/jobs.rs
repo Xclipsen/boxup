@@ -6,10 +6,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{Duration, Utc};
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, killpg};
 use nix::sys::statvfs::statvfs;
+use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
@@ -26,7 +30,9 @@ const CHECK_JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(47
 
 use crate::backend::Backend;
 use crate::config::{Config, validate_id, validate_service_name};
-use crate::domain::{CreateRequest, Snapshot, utc_now};
+use crate::domain::{
+    BackupPhase, BackupProgress, BackupResult, CreateProgress, CreateRequest, Snapshot, utc_now,
+};
 use crate::index::{Index, RefreshStats};
 
 pub struct JobRunner<'a, B: Backend + ?Sized> {
@@ -44,15 +50,84 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
         }
     }
 
-    pub async fn backup(&self) -> Result<Snapshot> {
+    pub async fn backup(&self) -> Result<BackupResult> {
+        self.backup_with_progress(|_| {}).await
+    }
+
+    pub async fn backup_with_progress<F>(&self, progress: F) -> Result<BackupResult>
+    where
+        F: Fn(BackupProgress) + Send + Sync,
+    {
+        let (_cancel, receiver) = tokio::sync::watch::channel(false);
+        self.backup_result_with_progress_cancellable(progress, receiver)
+            .await
+    }
+
+    pub async fn backup_with_progress_cancellable<F>(
+        &self,
+        progress: F,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Snapshot>
+    where
+        F: Fn(BackupProgress) + Send + Sync,
+    {
+        Ok(self
+            .backup_result_with_progress_cancellable(progress, cancel)
+            .await?
+            .snapshot)
+    }
+
+    pub async fn backup_result_with_progress_cancellable<F>(
+        &self,
+        progress: F,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<BackupResult>
+    where
+        F: Fn(BackupProgress) + Send + Sync,
+    {
         let _lock = LocalLock::acquire(&self.config.backup.state_dir, LockMode::Exclusive)?;
+        let estimate = self.index.estimated_backup_seconds(5)?;
         let job = self.index.start_job("backup")?;
-        let result = self.backup_inner().await;
-        self.record_result(job, "backup", &result).await?;
+        let mut reporter = ProgressReporter::new(self.index, job, estimate, &progress);
+        reporter.report_phase(BackupPhase::Preparing);
+        let mut result = self.backup_inner(&mut reporter, &mut cancel).await;
+        if let Ok(backup) = &result {
+            if let Err(error) = self.index.set_job_archive(
+                job,
+                &backup.snapshot.name,
+                &backup.snapshot.id,
+                reporter.stats_recorded(),
+            ) {
+                result = Err(error.context("failed to record created archive"));
+                reporter.report_phase(BackupPhase::Failed);
+            } else {
+                reporter.report_phase(BackupPhase::Complete);
+            }
+        } else {
+            reporter.report_phase(BackupPhase::Failed);
+        }
+        let success_message =
+            result
+                .as_ref()
+                .ok()
+                .and_then(|backup| match backup.notes.as_slice() {
+                    [] => None,
+                    [note] => Some(format!("Completed with note: {}", note.message())),
+                    notes => Some(format!(
+                        "Completed with notes: {}",
+                        notes
+                            .iter()
+                            .map(|note| note.message())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )),
+                });
+        self.record_result(job, "backup", &result, success_message.as_deref())
+            .await?;
         result
     }
 
-    pub async fn backup_if_due(&self) -> Result<Option<Snapshot>> {
+    pub async fn backup_if_due(&self) -> Result<Option<BackupResult>> {
         if let Some(last) = self.index.last_success("backup")? {
             if utc_now() - last < Duration::hours(self.config.schedule.due_hours as i64) {
                 tracing::info!("backup is not due");
@@ -71,7 +146,7 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
             self.index.refresh(self.backend),
         )
         .await;
-        self.record_result(job, "index", &result).await?;
+        self.record_result(job, "index", &result, None).await?;
         result
     }
 
@@ -121,7 +196,8 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
             Ok(())
         })
         .await;
-        self.record_result(job, "maintenance", &result).await?;
+        self.record_result(job, "maintenance", &result, None)
+            .await?;
         result
     }
 
@@ -134,17 +210,31 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
             self.backend.check(verify_data),
         )
         .await;
-        self.record_result(job, "check", &result).await?;
+        self.record_result(job, "check", &result, None).await?;
         result
     }
 
-    async fn backup_inner(&self) -> Result<Snapshot> {
+    async fn backup_inner<F>(
+        &self,
+        reporter: &mut ProgressReporter<'_, F>,
+        cancel: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<BackupResult>
+    where
+        F: Fn(BackupProgress) + Send + Sync,
+    {
         create_private_dir(&self.config.backup.state_dir)?;
         create_private_dir(&self.config.backup.cache_dir)?;
         let docker = DockerManager::new(self.config);
-        docker.recover_unfinished().await?;
-        let audit = docker.audit(true).await?;
-        let docker_snapshot = docker.prepare_snapshot(&audit).await?;
+        heartbeat_operation(docker.recover_unfinished(), reporter).await?;
+        reporter.report_phase(BackupPhase::Auditing);
+        let audit = heartbeat_operation(docker.audit(true), reporter).await?;
+        reporter.report_phase(BackupPhase::Staging);
+        let docker_snapshot =
+            heartbeat_operation(docker.prepare_snapshot(&audit), reporter).await?;
+        ensure!(
+            !*cancel.borrow(),
+            "backup cancelled after application data was safely resumed"
+        );
 
         let archive_name = format!(
             "{}-{}-{}",
@@ -165,7 +255,7 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
         });
         write_atomic(&inventory, &serde_json::to_vec_pretty(&inventory_value)?)?;
 
-        let mut sources = self.config.backup.sources.clone();
+        let mut sources = available_backup_sources(self.config)?;
         add_source_if_uncovered(&mut sources, inventory, self.config.backup.one_file_system);
         if let Some(snapshot) = &docker_snapshot {
             add_source_if_uncovered(
@@ -175,11 +265,21 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
             );
         }
         let mut excludes = self.config.backup.excludes.clone();
+        add_internal_exclude(&mut excludes, Path::new("/var/lib/boxup-recovery"), true)?;
         for (path, prefix) in [
             (&self.config.backup.cache_dir, true),
             (&self.config.restore.staging_dir, true),
             (&self.config.index.path, false),
             (&self.config.backup.state_dir.join("boxup.lock"), false),
+            (&self.config.backup.state_dir.join("setup-mode"), false),
+            (
+                &self
+                    .config
+                    .backup
+                    .state_dir
+                    .join("requires-live-validation"),
+                false,
+            ),
             (
                 &self.config.backup.state_dir.join("last-success.json"),
                 false,
@@ -212,40 +312,225 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
             "backup repository phase",
             BACKUP_REPOSITORY_TIMEOUT,
             async {
-                let snapshot = self.backend.create(&request).await?;
+                reporter.report_phase(BackupPhase::CreatingArchive);
+                let (progress_sender, mut progress_receiver) =
+                    tokio::sync::watch::channel(CreateProgress::default());
+                let create =
+                    self.backend
+                        .create_with_progress(&request, progress_sender, cancel.clone());
+                tokio::pin!(create);
+                let mut progress_open = true;
+                let mut stats_received = false;
+                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let backup = loop {
+                    tokio::select! {
+                        result = &mut create => break result?,
+                        _ = heartbeat.tick() => reporter.heartbeat(),
+                        changed = progress_receiver.changed(), if progress_open => {
+                            if changed.is_ok() {
+                                reporter.report_create(*progress_receiver.borrow_and_update());
+                                stats_received = true;
+                            } else {
+                                progress_open = false;
+                            }
+                        }
+                    }
+                };
+                if progress_receiver.has_changed().unwrap_or(false) {
+                    reporter.report_create(*progress_receiver.borrow_and_update());
+                    stats_received = true;
+                }
+                if stats_received {
+                    reporter.mark_stats_recorded();
+                }
                 ensure!(
-                    snapshot.name == request.archive_name,
+                    backup.snapshot.name == request.archive_name,
                     "backend created an unexpected archive name"
                 );
-                validate_archive_id("created archive id", &snapshot.id)?;
-                self.index.refresh(self.backend).await?;
-                Result::<Snapshot>::Ok(snapshot)
+                validate_archive_id("created archive id", &backup.snapshot.id)?;
+                Result::<BackupResult>::Ok(backup)
             },
         )
         .await?;
+        reporter.report_phase(BackupPhase::Finalizing);
         write_atomic(
             &self.config.backup.state_dir.join("last-success.json"),
             &serde_json::to_vec_pretty(&SuccessStamp {
                 version: 2,
                 host: self.config.host.id.clone(),
-                archive: snapshot.name.clone(),
-                archive_id: snapshot.id.clone(),
+                archive: snapshot.snapshot.name.clone(),
+                archive_id: snapshot.snapshot.id.clone(),
                 completed_at: utc_now(),
             })?,
         )?;
         Ok(snapshot)
     }
 
-    async fn record_result<T>(&self, job: i64, kind: &str, result: &Result<T>) -> Result<()> {
+    async fn record_result<T>(
+        &self,
+        job: i64,
+        kind: &str,
+        result: &Result<T>,
+        success_message: Option<&str>,
+    ) -> Result<()> {
         let (success, message) = match result {
-            Ok(_) => (true, None),
-            Err(_) => (false, Some(format!("{kind} failed; see privileged logs"))),
+            Ok(_) => (true, success_message.map(str::to_owned)),
+            Err(error) => (false, Some(user_error_message(kind, error))),
         };
         self.index.finish_job(job, success, message.as_deref())?;
         if let Err(error) = notify(self.config, kind, success).await {
             tracing::warn!("notification failed: {error:#}");
         }
         Ok(())
+    }
+}
+
+fn available_backup_sources(config: &Config) -> Result<Vec<PathBuf>> {
+    available_sources(&config.backup.sources)
+}
+
+fn available_sources(sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut available = Vec::new();
+    for source in sources {
+        match fs::symlink_metadata(source) {
+            Ok(_) => available.push(source.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!("configured backup source is absent: {}", source.display());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect backup source {}", source.display())
+                });
+            }
+        }
+    }
+    ensure!(
+        !available.is_empty(),
+        "none of the configured backup folders are present"
+    );
+    Ok(available)
+}
+
+fn user_error_message(kind: &str, error: &anyhow::Error) -> String {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    let reason = if message.contains("permission denied") {
+        "configured data could not be read"
+    } else if message.contains("no such file") || message.contains("not found") {
+        "required local data is missing"
+    } else if message.contains("ssh")
+        || message.contains("connection")
+        || message.contains("network")
+        || message.contains("repository")
+    {
+        "the backup destination could not be reached or verified"
+    } else if message.contains("cancel") || message.contains("signal") {
+        "the operation was interrupted"
+    } else if message.contains("lock") || message.contains("another boxup operation") {
+        "another Boxup operation is already running"
+    } else {
+        "open technical details for more information"
+    };
+    format!("{kind} failed: {reason}")
+}
+
+struct ProgressReporter<'a, F>
+where
+    F: Fn(BackupProgress) + Send + Sync,
+{
+    index: &'a Index,
+    job: i64,
+    started: Instant,
+    estimate: Option<u64>,
+    callback: &'a F,
+    current: BackupProgress,
+    last_persisted: Instant,
+    stats_recorded: bool,
+}
+
+impl<'a, F> ProgressReporter<'a, F>
+where
+    F: Fn(BackupProgress) + Send + Sync,
+{
+    fn new(index: &'a Index, job: i64, estimate: Option<u64>, callback: &'a F) -> Self {
+        let started = Instant::now();
+        Self {
+            index,
+            job,
+            started,
+            estimate,
+            callback,
+            current: BackupProgress {
+                phase: BackupPhase::Preparing,
+                elapsed_seconds: 0,
+                estimated_total_seconds: estimate,
+                files: 0,
+                original_bytes: 0,
+                compressed_bytes: 0,
+                deduplicated_bytes: 0,
+            },
+            last_persisted: started
+                .checked_sub(std::time::Duration::from_secs(2))
+                .unwrap_or(started),
+            stats_recorded: false,
+        }
+    }
+
+    fn report_phase(&mut self, phase: BackupPhase) {
+        self.current.phase = phase;
+        self.emit(true);
+    }
+
+    fn report_create(&mut self, progress: CreateProgress) {
+        self.current.files = progress.files;
+        self.current.original_bytes = progress.original_bytes;
+        self.current.compressed_bytes = progress.compressed_bytes;
+        self.current.deduplicated_bytes = progress.deduplicated_bytes;
+        self.emit(false);
+    }
+
+    fn heartbeat(&mut self) {
+        self.emit(false);
+    }
+
+    fn mark_stats_recorded(&mut self) {
+        self.stats_recorded = true;
+    }
+
+    fn stats_recorded(&self) -> bool {
+        self.stats_recorded
+    }
+
+    fn emit(&mut self, force_persist: bool) {
+        self.current.elapsed_seconds = self.started.elapsed().as_secs();
+        self.current.estimated_total_seconds = self.estimate;
+        (self.callback)(self.current);
+        if force_persist || self.last_persisted.elapsed() >= std::time::Duration::from_secs(1) {
+            if let Err(error) = self.index.update_job_progress(self.job, &self.current) {
+                tracing::warn!("failed to persist backup progress: {error:#}");
+            } else {
+                self.last_persisted = Instant::now();
+            }
+        }
+    }
+}
+
+async fn heartbeat_operation<T, Fut, F>(
+    operation: Fut,
+    reporter: &mut ProgressReporter<'_, F>,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+    F: Fn(BackupProgress) + Send + Sync,
+{
+    tokio::pin!(operation);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = heartbeat.tick() => reporter.heartbeat(),
+        }
     }
 }
 
@@ -294,6 +579,30 @@ impl LocalLock {
                 .with_context(|| format!("another Boxup operation holds {}", path.display()));
         }
         Ok(Self { file })
+    }
+
+    pub fn is_held(state_dir: &Path) -> Result<bool> {
+        let path = state_dir.join("boxup.lock");
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        // SAFETY: flock only reads the valid descriptor and does not retain any pointer.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        if result == 0 {
+            // SAFETY: the descriptor remains valid for this call.
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(true)
+        } else {
+            Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
     }
 }
 
@@ -1005,7 +1314,10 @@ async fn run_command(
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
-    command.stderr(Stdio::null()).kill_on_drop(true);
+    command
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .process_group(0);
 
     let mut terminate_signal = if interruptible {
         Some(tokio::signal::unix::signal(
@@ -1017,11 +1329,16 @@ async fn run_command(
     let mut child = command
         .spawn()
         .context("failed to execute external program")?;
+    let process_group = child
+        .id()
+        .and_then(|value| i32::try_from(value).ok())
+        .map(Pid::from_raw)
+        .context("external program has no valid process group id")?;
     let stdout = if capture_stdout {
         match child.stdout.take() {
             Some(stdout) => Some(stdout),
             None => {
-                terminate_and_reap(&mut child).await?;
+                terminate_and_reap(&mut child, process_group).await?;
                 bail!("external program stdout was unavailable");
             }
         }
@@ -1032,7 +1349,7 @@ async fn run_command(
         match child.stdin.take() {
             Some(stdin) => Some(stdin),
             None => {
-                terminate_and_reap(&mut child).await?;
+                terminate_and_reap(&mut child, process_group).await?;
                 bail!("external program stdin was unavailable");
             }
         }
@@ -1079,43 +1396,59 @@ async fn run_command(
     let (status, output) = match outcome {
         CommandWait::Completed(result) => result?,
         CommandWait::Interrupted => {
-            terminate_and_reap(&mut child)
+            terminate_and_reap(&mut child, process_group)
                 .await
                 .context("operation interrupted; failed to terminate and reap external program")?;
             bail!("operation interrupted");
         }
         CommandWait::Terminated => {
-            terminate_and_reap(&mut child)
+            terminate_and_reap(&mut child, process_group)
                 .await
                 .context("operation terminated; failed to terminate and reap external program")?;
             bail!("operation terminated");
         }
         CommandWait::TimedOut => {
-            terminate_and_reap(&mut child).await.with_context(|| {
+            terminate_and_reap(&mut child, process_group)
+                .await
+                .with_context(|| {
                 format!(
                     "external program timed out after {timeout:?}; failed to terminate and reap it"
                 )
-            })?;
+                })?;
             bail!("external program timed out after {timeout:?}");
         }
     };
     Ok((status, output))
 }
 
-async fn terminate_and_reap(child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-    if let Err(kill_error) = child.start_kill() {
-        if child.try_wait()?.is_none() {
-            return Err(kill_error).context("failed to terminate external program");
+async fn terminate_and_reap(child: &mut Child, pid: Pid) -> Result<()> {
+    let mut leader_reaped = child.try_wait()?.is_some();
+    if !leader_reaped {
+        if let Err(error) = killpg(pid, Signal::SIGTERM)
+            && error != Errno::ESRCH
+        {
+            return Err(error).context("failed to terminate external process group");
         }
-        return Ok(());
+        leader_reaped =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(result) => {
+                    result.context("failed to reap terminated external program")?;
+                    true
+                }
+                Err(_) => false,
+            };
     }
-    child
-        .wait()
-        .await
-        .context("failed to reap terminated external program")?;
+    if let Err(error) = killpg(pid, Signal::SIGKILL)
+        && error != Errno::ESRCH
+    {
+        return Err(error).context("failed to kill remaining external process group");
+    }
+    if !leader_reaped {
+        child
+            .wait()
+            .await
+            .context("failed to reap killed external program")?;
+    }
     Ok(())
 }
 
@@ -1392,9 +1725,35 @@ mod tests {
         )
         .unwrap();
         add_internal_exclude(&mut excludes, Path::new("/var/cache/boxup"), true).unwrap();
+        add_internal_exclude(&mut excludes, Path::new("/var/lib/boxup-recovery"), true).unwrap();
         assert_eq!(
             excludes,
-            ["pf:var/lib/boxup/index.sqlite3", "pp:var/cache/boxup"]
+            [
+                "pf:var/lib/boxup/index.sqlite3",
+                "pp:var/cache/boxup",
+                "pp:var/lib/boxup-recovery"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_configured_sources_fail_before_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let present = temp.path().join("present");
+        fs::create_dir(&present).unwrap();
+        let missing = temp.path().join("missing");
+
+        let error = available_sources(&[present, missing]).unwrap_err();
+
+        assert!(format!("{error:#}").contains("configured backup source is absent"));
+    }
+
+    #[test]
+    fn user_errors_are_actionable_without_exposing_paths() {
+        let error = anyhow::anyhow!("/secret/source: Permission denied");
+        assert_eq!(
+            user_error_message("backup", &error),
+            "backup failed: configured data could not be read"
         );
     }
 
@@ -1403,16 +1762,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("blocking-command");
         let pid_path = temp.path().join("pid");
+        let descendant_pid_path = temp.path().join("descendant-pid");
         fs::write(
             &script,
-            "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" >\"$1\"\nexec /usr/bin/sleep 30\n",
+            "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" >\"$1\"\n/bin/sh -c 'trap \"\" TERM; exec /usr/bin/sleep 30' &\nprintf '%s' \"$!\" >\"$2\"\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&script, permissions).unwrap();
         let mut command = Command::new(&script);
-        command.arg(&pid_path);
+        command.arg(&pid_path).arg(&descendant_pid_path);
         let started = std::time::Instant::now();
         let error = checked_output(command, false, std::time::Duration::from_millis(200))
             .await
@@ -1421,7 +1781,24 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
 
         let pid: libc::pid_t = fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        let descendant_pid: libc::pid_t = fs::read_to_string(descendant_pid_path)
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        for _ in 0..20 {
+            let state = fs::read_to_string(format!("/proc/{descendant_pid}/stat"))
+                .ok()
+                .and_then(|value| value.split_whitespace().nth(2).map(str::to_owned));
+            if state.as_deref().is_none_or(|state| state == "Z") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let descendant_state = fs::read_to_string(format!("/proc/{descendant_pid}/stat"))
+            .ok()
+            .and_then(|value| value.split_whitespace().nth(2).map(str::to_owned));
+        assert!(descendant_state.as_deref().is_none_or(|state| state == "Z"));
         let mut status = 0;
         // SAFETY: waitpid only writes to the valid status pointer; the PID came from our child.
         let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };

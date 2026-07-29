@@ -14,7 +14,7 @@ use nix::unistd::{Gid, Uid, fchown};
 use tempfile::Builder;
 
 use crate::backend::Backend;
-use crate::config::{Config, validate_absolute};
+use crate::config::{Config, validate_absolute, validate_id};
 use crate::domain::{ArchiveItem, FileType};
 use crate::jobs::{LocalLock, LockMode};
 
@@ -45,6 +45,106 @@ pub struct RestoreProgress {
     pub total: u64,
     pub files: u64,
     pub bytes: u64,
+}
+
+const SAFE_RECOVERY_ROOT: &str = "/var/lib/boxup-recovery";
+
+pub fn prepare_safe_restore_target(config: &Config, target: &Path) -> Result<()> {
+    ensure!(
+        nix::unistd::Uid::effective().is_root(),
+        "safe restore requires root"
+    );
+    let recovery_root = Path::new(SAFE_RECOVERY_ROOT);
+    validate_safe_restore_target_path(config, target, recovery_root)?;
+    let recovery_parent = recovery_root
+        .parent()
+        .context("safe recovery root has no parent")?;
+    ensure_no_symlink_components(recovery_parent)?;
+    let parent_metadata = open_directory_no_follow(recovery_parent)?.metadata()?;
+    ensure!(
+        parent_metadata.uid() == 0 && parent_metadata.mode() & 0o022 == 0,
+        "safe recovery parent must be root-owned and non-writable"
+    );
+    ensure_private_root_directory(recovery_root)?;
+    ensure_private_root_directory(&recovery_root.join(&config.host.id))?;
+    validate_safe_restore_target_ready(config, target, recovery_root)
+}
+
+fn validate_safe_restore_target_path(
+    config: &Config,
+    target: &Path,
+    recovery_root: &Path,
+) -> Result<()> {
+    validate_id("host.id", &config.host.id)?;
+    validate_absolute(recovery_root)?;
+    validate_absolute(target)?;
+    let host_root = recovery_root.join(&config.host.id);
+    ensure!(
+        target.parent() == Some(host_root.as_path()),
+        "safe restore target must be a direct child of {}",
+        host_root.display()
+    );
+    let leaf = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("safe restore target leaf is not UTF-8")?;
+    validate_id("safe restore target leaf", leaf)?;
+    let timestamp = leaf
+        .strip_prefix("restore-")
+        .context("safe restore target leaf must begin with restore-")?;
+    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%SZ")
+        .context("safe restore target leaf must contain a UTC timestamp")?;
+    Ok(())
+}
+
+fn validate_safe_restore_target_ready(
+    config: &Config,
+    target: &Path,
+    recovery_root: &Path,
+) -> Result<()> {
+    validate_safe_restore_target_path(config, target, recovery_root)?;
+    ensure_no_symlink_components(&recovery_root.join(&config.host.id))?;
+    match fs::symlink_metadata(target) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => bail!("safe restore target already exists: {}", target.display()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_private_root_directory(path: &Path) -> Result<()> {
+    validate_absolute(path)?;
+    let parent = path
+        .parent()
+        .context("private recovery directory has no parent")?;
+    let name = path
+        .file_name()
+        .context("private recovery directory has no name")?;
+    let parent = open_directory_no_follow(parent)?;
+    let created = match mkdirat(&parent, name, Mode::from_bits_truncate(0o700)) {
+        Ok(()) => true,
+        Err(Errno::EEXIST) => false,
+        Err(error) => return Err(error.into()),
+    };
+    let directory = File::from(
+        openat(
+            &parent,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("refusing unsafe recovery directory {}", path.display()))?,
+    );
+    if created {
+        fchown(&directory, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))?;
+        fchmod(&directory, Mode::from_bits_truncate(0o700))?;
+    }
+    let metadata = directory.metadata()?;
+    ensure!(
+        metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700,
+        "safe recovery directory must be root-owned mode 0700: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 pub async fn restore<B: Backend + ?Sized>(
@@ -1249,6 +1349,60 @@ mod tests {
     }
 
     #[test]
+    fn safe_restore_target_is_an_absent_timestamped_host_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let recovery_root = temp.path().join("recovery");
+        let host_root = recovery_root.join("test");
+        fs::create_dir_all(&host_root).unwrap();
+        let target = host_root.join("restore-20260728T142305Z");
+
+        validate_safe_restore_target_ready(&config, &target, &recovery_root).unwrap();
+
+        fs::create_dir(&target).unwrap();
+        assert!(validate_safe_restore_target_ready(&config, &target, &recovery_root).is_err());
+        assert!(
+            validate_safe_restore_target_path(
+                &config,
+                &recovery_root.join("other/restore-20260728T142305Z"),
+                &recovery_root,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_safe_restore_target_path(
+                &config,
+                &host_root.join("restore-not-a-timestamp"),
+                &recovery_root,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_safe_restore_target_path(
+                &config,
+                &host_root.join("../test/restore-20260728T142305Z"),
+                &recovery_root,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn safe_restore_target_refuses_symlinked_host_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let recovery_root = temp.path().join("recovery");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&recovery_root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, recovery_root.join("test")).unwrap();
+        let target = recovery_root.join("test").join("restore-20260728T142305Z");
+
+        assert!(validate_safe_restore_target_ready(&config, &target, &recovery_root).is_err());
+        assert!(!outside.join("restore-20260728T142305Z").exists());
+    }
+
+    #[test]
     fn publishes_into_an_existing_empty_destination() {
         let temp = tempfile::tempdir().unwrap();
         let staging = temp.path().join("staging");
@@ -1508,7 +1662,7 @@ mod tests {
             ])))
         }
 
-        async fn create(&self, _request: &CreateRequest) -> Result<Snapshot> {
+        async fn create(&self, _request: &CreateRequest) -> Result<crate::domain::BackupResult> {
             bail!("not used")
         }
 

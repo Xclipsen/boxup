@@ -2,7 +2,7 @@
 set -eu
 
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-version=0.1.0
+version=0.2.0
 epoch=${SOURCE_DATE_EPOCH:-0}
 output_dir=${BOXUP_OUTPUT_DIR:-"$project_dir/dist"}
 archive="$output_dir/boxup-$version.tar.gz"
@@ -54,6 +54,9 @@ SECURITY.md
 docs/RESTORE.md
 examples/desktop.toml
 examples/ubuntu-docker-vps.toml
+completions/_boxup
+completions/boxup.bash
+completions/boxup.fish
 packaging/arch/boxup.install
 packaging/debian/build-deb.sh
 packaging/debian/debian/changelog
@@ -70,13 +73,18 @@ packaging/systemd/boxup-backup-now@.service
 packaging/systemd/boxup-backup-server@.timer
 packaging/systemd/boxup-check@.service
 packaging/systemd/boxup-check@.timer
+packaging/systemd/boxup-index@.service
+packaging/systemd/boxup-index@.timer
 packaging/systemd/boxup-maintenance@.service
 packaging/systemd/boxup-maintenance@.timer
+packaging/systemd/boxup-notify@.service
 scripts/bootstrap.sh
 scripts/check-rust-version.sh
 scripts/make-source-archive.sh
 scripts/prepare-arch-package.sh
 scripts/setup-profile.sh
+scripts/setup-backup-sudo.sh
+scripts/setup-automation.sh
 scripts/vendor-dependencies.sh
 scripts/vendor-linux-dependencies.py
 scripts/verify-packaging.sh
@@ -92,9 +100,11 @@ src/index.rs
 src/jobs.rs
 src/lib.rs
 src/restore.rs
+src/setup.rs
 src/tui.rs
 tests/docker_workflow.rs
 tests/fake_borg.rs
+tests/setup-automation.sh
 tests/fixtures/archive-list.jsonl
 tests/fixtures/create.json
 tests/fixtures/diff.jsonl
@@ -124,7 +134,7 @@ checksum=$(sha256sum "$temporary_archive" | cut -d ' ' -f 1)
 printf '%s  %s\n' "$checksum" "$(basename "$archive")" >"$temporary_checksum"
 mv "$temporary_archive" "$archive"
 mv "$temporary_checksum" "$checksum_file"
-rm -f "$temporary_tar"
+rm -f "$temporary_tar" "$temporary_allowlist" "$temporary_files"
 trap - EXIT HUP INT TERM
 printf 'sha256sums=(%s)\n' "'$checksum'"
 printf 'Created %s and %s.\n' "$archive" "$checksum_file"

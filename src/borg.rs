@@ -25,13 +25,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{Backend, DiffStream, FileStream};
 use crate::config::{Config, RepositoryConfig, validate_id};
 use crate::domain::{
-    ArchiveItem, CreateRequest, DiffEntry, ExtractProgress, FileType, RepositoryIdentity, Snapshot,
+    ArchiveItem, BackupNote, BackupResult, CreateProgress, CreateRequest, DiffEntry,
+    ExtractProgress, FileType, RepositoryIdentity, Snapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorgExit {
     Success,
-    Warning,
+    Warning(i32),
 }
 
 #[derive(Debug)]
@@ -75,10 +76,12 @@ impl BorgRunner {
         let (mut command, passphrase) = self.command(args, cwd, admin).await?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let child = spawn_with_passphrase(command, passphrase).await?;
+        let mut process_group = ProcessGroupGuard::new(&child);
         let output = child
             .wait_with_output()
             .await
             .context("failed to wait for Borg")?;
+        process_group.disarm();
         classify_output(output.status.code(), output.stdout, output.stderr)
     }
 
@@ -95,6 +98,7 @@ impl BorgRunner {
         let (mut command, passphrase) = self.command(args, Some(cwd), false).await?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = spawn_with_passphrase(command, passphrase).await?;
+        let mut process_group = ProcessGroupGuard::new(&child);
         let mut stdout = child.stdout.take().context("Borg stdout was unavailable")?;
         let stderr = child.stderr.take().context("Borg stderr was unavailable")?;
         let stdout_task = tokio::spawn(async move {
@@ -128,10 +132,116 @@ impl BorgRunner {
             Result::<()>::Ok(())
         });
         let status = child.wait().await.context("failed to wait for Borg")?;
+        process_group.disarm();
         let stdout = stdout_task.await.context("Borg stdout task failed")??;
         stderr_task.await.context("Borg progress task failed")??;
         // Progress JSON contains archive paths, so never include raw stderr in errors.
         classify_output(status.code(), stdout, Vec::new())
+    }
+
+    async fn run_create_with_progress<I, S>(
+        &self,
+        args: I,
+        progress: tokio::sync::watch::Sender<CreateProgress>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<BorgOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let (mut command, passphrase) = self.command(args, None, false).await?;
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = spawn_with_passphrase(command, passphrase).await?;
+        let mut process_group = ProcessGroupGuard::new(&child);
+        let mut stdout = child.stdout.take().context("Borg stdout was unavailable")?;
+        let stderr = child.stderr.take().context("Borg stderr was unavailable")?;
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await?;
+            Result::<Vec<u8>>::Ok(bytes)
+        });
+        let progress_output = progress.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut diagnostics = Vec::new();
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(line) = lines.next_line().await? {
+                if line.len() > 64 * 1024 {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<BorgCreateProgressLine>(&line) {
+                    if event.kind.as_deref() == Some("archive_progress") && !event.finished {
+                        if let (
+                            Some(files),
+                            Some(original_bytes),
+                            Some(compressed_bytes),
+                            Some(deduplicated_bytes),
+                        ) = (
+                            event.files,
+                            event.original_bytes,
+                            event.compressed_bytes,
+                            event.deduplicated_bytes,
+                        ) {
+                            let _ = progress_output.send(CreateProgress {
+                                files,
+                                original_bytes,
+                                compressed_bytes,
+                                deduplicated_bytes,
+                            });
+                        }
+                    }
+                    if event.kind.as_deref() == Some("log_message")
+                        && event
+                            .level_name
+                            .as_deref()
+                            .is_some_and(|level| matches!(level, "WARNING" | "ERROR" | "CRITICAL"))
+                    {
+                        append_borg_diagnostic(
+                            &mut diagnostics,
+                            event.message.as_deref().or(event.msgid.as_deref()),
+                        );
+                    }
+                    // Progress events contain source paths. Only numeric progress fields and
+                    // explicit warning/error messages are allowed to leave this parser.
+                    continue;
+                }
+                if diagnostics.len() < 8 * 1024 {
+                    diagnostics.extend_from_slice(line.as_bytes());
+                    diagnostics.push(b'\n');
+                }
+            }
+            Result::<Vec<u8>>::Ok(diagnostics)
+        });
+        let pid = process_group
+            .pid
+            .context("Borg process id was unavailable")?;
+        let wait = child.wait();
+        tokio::pin!(wait);
+        let mut cancelled = *cancel.borrow();
+        let status = if cancelled {
+            wait_for_cancelled_borg(&mut wait, pid).await?
+        } else {
+            loop {
+                tokio::select! {
+                    status = &mut wait => break status.context("failed to wait for Borg")?,
+                    changed = cancel.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        if *cancel.borrow_and_update() {
+                            cancelled = true;
+                            break wait_for_cancelled_borg(&mut wait, pid).await?;
+                        }
+                    }
+                }
+            }
+        };
+        process_group.disarm();
+        let stdout = stdout_task.await.context("Borg stdout task failed")??;
+        let stderr = stderr_task.await.context("Borg progress task failed")??;
+        if cancelled {
+            bail!("Borg create cancelled after a safe shutdown request");
+        }
+        classify_output(status.code(), stdout, stderr)
     }
 
     async fn stream_json_lines<I, S, T, F>(
@@ -149,6 +259,7 @@ impl BorgRunner {
         let (mut command, passphrase) = self.command(args, None, admin).await?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = spawn_with_passphrase(command, passphrase).await?;
+        let mut process_group = ProcessGroupGuard::new(&child);
         let stdout = child.stdout.take().context("Borg stdout was unavailable")?;
         let stderr = child.stderr.take().context("Borg stderr was unavailable")?;
         let (sender, receiver) = mpsc::channel(128);
@@ -165,19 +276,28 @@ impl BorgRunner {
                     Ok(Some(line)) => {
                         let parsed = parse(&line);
                         if sender.send(parsed).await.is_err() {
-                            let _ = child.kill().await;
+                            if let Some(pid) = process_group.pid {
+                                let _ = nix::sys::signal::killpg(
+                                    pid,
+                                    nix::sys::signal::Signal::SIGTERM,
+                                );
+                            }
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
                         let _ = sender.send(Err(error.into())).await;
-                        let _ = child.kill().await;
+                        if let Some(pid) = process_group.pid {
+                            let _ =
+                                nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGTERM);
+                        }
                         break;
                     }
                 }
             }
             let status = child.wait().await;
+            process_group.disarm();
             let stderr = stderr_task.await.unwrap_or_default();
             match status {
                 Ok(status) if status.code() == Some(0) => {}
@@ -256,7 +376,8 @@ impl BorgRunner {
             .env("BORG_RSH", self.borg_rsh(admin))
             .env("BORG_PASSPHRASE_FD", "0")
             .stdin(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .process_group(0);
         Ok((command, passphrase))
     }
 
@@ -275,6 +396,54 @@ impl BorgRunner {
             ssh_key.display(),
             self.repository.known_hosts.display()
         )
+    }
+}
+
+struct ProcessGroupGuard {
+    pid: Option<nix::unistd::Pid>,
+}
+
+async fn wait_for_cancelled_borg<F>(
+    wait: &mut F,
+    pid: nix::unistd::Pid,
+) -> Result<std::process::ExitStatus>
+where
+    F: std::future::Future<Output = std::io::Result<std::process::ExitStatus>> + Unpin,
+{
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGINT);
+    if let Ok(status) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut *wait).await {
+        return status.context("failed to wait for cancelled Borg");
+    }
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGTERM);
+    if let Ok(status) = tokio::time::timeout(std::time::Duration::from_secs(10), &mut *wait).await {
+        return status.context("failed to wait for terminated Borg");
+    }
+    let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+    wait.await.context("failed to reap killed Borg")
+}
+
+impl ProcessGroupGuard {
+    fn new(child: &Child) -> Self {
+        Self {
+            pid: child
+                .id()
+                .and_then(|id| i32::try_from(id).ok())
+                .map(nix::unistd::Pid::from_raw),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            // This drop path is the final fallback for an unexpectedly cancelled future.
+            // Kill the group so no Borg or SSH descendant can outlive Boxup's lock.
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+        }
     }
 }
 
@@ -412,9 +581,26 @@ impl Backend for BorgBackend {
             .await
     }
 
-    async fn create(&self, request: &CreateRequest) -> Result<Snapshot> {
+    async fn create(&self, request: &CreateRequest) -> Result<BackupResult> {
+        let (progress, _receiver) = tokio::sync::watch::channel(CreateProgress::default());
+        let (_cancel, cancel) = tokio::sync::watch::channel(false);
+        self.create_with_progress(request, progress, cancel).await
+    }
+
+    async fn create_with_progress(
+        &self,
+        request: &CreateRequest,
+        progress: tokio::sync::watch::Sender<CreateProgress>,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<BackupResult> {
         validate_id("archive name", &request.archive_name)?;
-        let mut args: Vec<OsString> = vec!["create".into(), "--json".into(), "--stats".into()];
+        let mut args: Vec<OsString> = vec![
+            "create".into(),
+            "--json".into(),
+            "--stats".into(),
+            "--progress".into(),
+            "--log-json".into(),
+        ];
         args.push("--compression".into());
         args.push(request.compression.clone().into());
         if request.one_file_system {
@@ -439,14 +625,33 @@ impl Backend for BorgBackend {
                 .iter()
                 .map(|path| path.as_os_str().to_owned()),
         );
-        let output = require_success(self.runner.run(args, None, false).await?)?;
+        let output = self
+            .runner
+            .run_create_with_progress(args, progress.clone(), cancel)
+            .await?;
+        let note = match output.exit {
+            BorgExit::Success => None,
+            BorgExit::Warning(100) => Some(BackupNote::FilesChangedWhileBeingRead),
+            BorgExit::Warning(_) => return require_success(output).map(|_| unreachable!()),
+        };
         let created: CreateOutput = serde_json::from_slice(&output.stdout)?;
+        if let Some(stats) = &created.archive.stats {
+            let _ = progress.send(CreateProgress {
+                files: stats.files,
+                original_bytes: stats.original_bytes,
+                compressed_bytes: stats.compressed_bytes,
+                deduplicated_bytes: stats.deduplicated_bytes,
+            });
+        }
         let snapshot: Snapshot = created.archive.try_into()?;
         ensure!(
             snapshot.name == request.archive_name,
             "Borg created an unexpected archive name"
         );
-        Ok(snapshot)
+        Ok(BackupResult {
+            snapshot,
+            notes: note.into_iter().collect(),
+        })
     }
 
     async fn extract(&self, snapshot: &str, paths: &[String], destination: &Path) -> Result<()> {
@@ -703,7 +908,7 @@ fn classify_output(code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Resul
             Ok(BorgOutput {
                 stdout,
                 stderr,
-                exit: BorgExit::Warning,
+                exit: BorgExit::Warning(code),
             })
         }
         Some(code) => Err(BorgError::ErrorExit {
@@ -722,7 +927,7 @@ fn is_warning_code(code: i32) -> bool {
 fn require_success(output: BorgOutput) -> Result<BorgOutput> {
     match output.exit {
         BorgExit::Success => Ok(output),
-        BorgExit::Warning => Err(BorgError::WarningExit {
+        BorgExit::Warning(_) => Err(BorgError::WarningExit {
             message: safe_stderr(&output.stderr),
         }
         .into()),
@@ -796,6 +1001,20 @@ struct SnapshotRaw {
     end: Option<DateTime<Utc>>,
     hostname: Option<String>,
     username: Option<String>,
+    #[serde(default)]
+    stats: Option<CreateStatsRaw>,
+}
+
+#[derive(Deserialize)]
+struct CreateStatsRaw {
+    #[serde(default, rename = "nfiles")]
+    files: u64,
+    #[serde(default, rename = "original_size")]
+    original_bytes: u64,
+    #[serde(default, rename = "compressed_size")]
+    compressed_bytes: u64,
+    #[serde(default, rename = "deduplicated_size")]
+    deduplicated_bytes: u64,
 }
 
 impl TryFrom<SnapshotRaw> for Snapshot {
@@ -846,6 +1065,48 @@ struct BorgProgressLine {
     total: Option<u64>,
     #[serde(default)]
     finished: bool,
+}
+
+#[derive(Deserialize)]
+struct BorgCreateProgressLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    finished: bool,
+    #[serde(rename = "nfiles")]
+    files: Option<u64>,
+    #[serde(rename = "original_size")]
+    original_bytes: Option<u64>,
+    #[serde(rename = "compressed_size")]
+    compressed_bytes: Option<u64>,
+    #[serde(rename = "deduplicated_size")]
+    deduplicated_bytes: Option<u64>,
+    #[serde(rename = "levelname")]
+    level_name: Option<String>,
+    message: Option<String>,
+    msgid: Option<String>,
+}
+
+fn append_borg_diagnostic(output: &mut Vec<u8>, message: Option<&str>) {
+    let Some(message) = message.map(str::trim).filter(|message| !message.is_empty()) else {
+        return;
+    };
+    if !output.is_empty() && output.len() < 8 * 1024 {
+        output.push(b'\n');
+    }
+    for character in message.chars() {
+        if output.len() >= 8 * 1024 {
+            break;
+        }
+        if !character.is_control() || character == '\t' {
+            let mut encoded = [0_u8; 4];
+            let encoded = character.encode_utf8(&mut encoded).as_bytes();
+            if output.len() + encoded.len() > 8 * 1024 {
+                break;
+            }
+            output.extend_from_slice(encoded);
+        }
+    }
 }
 
 fn parse_archive_item(line: &str) -> Result<ArchiveItem> {
@@ -1069,15 +1330,15 @@ mod tests {
         );
         assert_eq!(
             classify_output(Some(1), vec![], vec![]).unwrap().exit,
-            BorgExit::Warning
+            BorgExit::Warning(1)
         );
         assert_eq!(
             classify_output(Some(100), vec![], vec![]).unwrap().exit,
-            BorgExit::Warning
+            BorgExit::Warning(100)
         );
         assert_eq!(
             classify_output(Some(127), vec![], vec![]).unwrap().exit,
-            BorgExit::Warning
+            BorgExit::Warning(127)
         );
         assert!(classify_output(Some(99), vec![], b"error".to_vec()).is_err());
         assert!(classify_output(Some(128), vec![], b"signal".to_vec()).is_err());

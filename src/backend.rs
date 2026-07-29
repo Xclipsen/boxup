@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use crate::domain::{
-    ArchiveItem, CreateRequest, DiffEntry, ExtractProgress, RepositoryIdentity, Snapshot,
+    ArchiveItem, BackupResult, CreateProgress, CreateRequest, DiffEntry, ExtractProgress,
+    RepositoryIdentity, Snapshot,
 };
 
 pub type FileStream = Pin<Box<dyn Stream<Item = Result<ArchiveItem>> + Send>>;
@@ -40,7 +41,17 @@ pub trait Backend: Send + Sync {
             },
         )))
     }
-    async fn create(&self, request: &CreateRequest) -> Result<Snapshot>;
+    async fn create(&self, request: &CreateRequest) -> Result<BackupResult>;
+    async fn create_with_progress(
+        &self,
+        request: &CreateRequest,
+        progress: tokio::sync::watch::Sender<CreateProgress>,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<BackupResult> {
+        let result = self.create(request).await;
+        drop(progress);
+        result
+    }
     async fn extract(&self, snapshot: &str, paths: &[String], destination: &Path) -> Result<()>;
     async fn extract_with_progress(
         &self,

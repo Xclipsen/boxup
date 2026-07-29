@@ -1,0 +1,72 @@
+#compdef boxup
+
+local -a commands
+commands=(
+  'setup:open the guided setup'
+  'automation:manage automatic backups and indexing'
+  'init:initialize a verified new repository'
+  'backup:create a backup archive'
+  'status:show local backup and index status'
+  'snapshots:list snapshots'
+  'ls:list archive contents'
+  'search:search the local index'
+  'restore:restore selected paths'
+  'mount:mount a snapshot'
+  'umount:unmount a snapshot'
+  'diff:compare snapshots'
+  'prune:apply retention policy'
+  'check:check repository integrity'
+  'index:manage the local index'
+  'config:validate or describe configuration'
+  'key:manage repository key export'
+  'audit:audit configured workloads'
+  'tui:open the terminal dashboard'
+  'help:show command help'
+)
+
+local context state line command
+_arguments -C \
+  '(-h --help)'{-h,--help}'[show help]' \
+  '(-V --version)'{-V,--version}'[show version]' \
+  '--config=[configuration file]:file:_files' \
+  '--browse-config=[browse descriptor]:file:_files' \
+  '1:command:->command' \
+  '*::argument:->arguments'
+
+case $state in
+  command)
+    _describe 'boxup command' commands
+    ;;
+  arguments)
+    if (( ${words[(I)validate]} || ${words[(I)browse-descriptor]} )); then
+      _values 'option' --system-profile --help
+      return
+    fi
+    if (( ${words[(I)export]} )); then
+      _values 'option' --to --help
+      return
+    fi
+    if (( ${words[(I)docker]} )); then
+      _values 'option' --json --running --help
+      return
+    fi
+    for command in ${words[2,-1]}; do
+      case $command in
+        backup) _values 'backup command' run --help; return ;;
+        automation) _values 'automation command' enable disable status --json --help; return ;;
+        status) _values 'option' --json --help; return ;;
+        snapshots|ls) _values 'option' --json --live --help; return ;;
+        search) _values 'option' --all-snapshots --json --help; return ;;
+        restore) _values 'option' --to --overwrite --sudo --help; return ;;
+        diff) _values 'option' --json --help; return ;;
+        prune) _values 'option' --dry-run --help; return ;;
+        check) _values 'option' --verify-data --help; return ;;
+        index) _values 'index command' refresh --help; return ;;
+        config) _values 'config command' validate browse-descriptor --help; return ;;
+        key) _values 'key command' export --help; return ;;
+        audit) _values 'audit command' docker --help; return ;;
+      esac
+    done
+    _files
+    ;;
+esac
