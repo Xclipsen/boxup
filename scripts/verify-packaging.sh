@@ -106,7 +106,7 @@ grep -Fq "\"/var/lib/boxup-docker/\$profile\"" "$setup"
 grep -Fq "config validate \\" "$setup"
 grep -Fq -- "--system-profile \"\$system_config\"" "$setup"
 grep -Fq "boxup-root --config \"\$system_config\" prepare" "$setup"
-grep -Fq 'setup-backup-sudo "$profile" "$browse_user"' "$setup"
+grep -Fq "setup-backup-sudo \"\$profile\" \"\$browse_user\"" "$setup"
 grep -Fq "boxup-root --config \"\$system_config\" print-schedule" "$setup"
 grep -Fq "systemd-analyze calendar \"\$calendar\"" "$setup"
 
@@ -117,14 +117,14 @@ grep -Fq '<allow_active>auth_admin</allow_active>' "$project_dir/packaging/polki
 grep -Fq '<annotate key="org.freedesktop.policykit.exec.path">/usr/lib/boxup/setup-automation</annotate>' \
   "$project_dir/packaging/polkit/org.boxup.policy"
 
-grep -Fq '"$boxup_root_path" --config "$config" print-schedule' "$automation"
-grep -Fq '"$systemctl_path" daemon-reload' "$automation"
-grep -Fq '"$systemctl_path" disable --now "$other_backup_timer"' "$automation"
-grep -Fq '"$systemctl_path" enable --now "$backup_timer"' "$automation"
-grep -Fq '"$systemctl_path" enable --now "$index_timer"' "$automation"
-grep -Fq 'boxup-backup-desktop@$profile.timer' "$automation"
-grep -Fq 'boxup-backup-server@$profile.timer' "$automation"
-grep -Fq 'boxup-index@$profile.timer' "$automation"
+grep -Fq "\"\$boxup_root_path\" --config \"\$config\" print-schedule" "$automation"
+grep -Fq "\"\$systemctl_path\" daemon-reload" "$automation"
+grep -Fq "\"\$systemctl_path\" disable --now \"\$other_backup_timer\"" "$automation"
+grep -Fq "\"\$systemctl_path\" enable --now \"\$backup_timer\"" "$automation"
+grep -Fq "\"\$systemctl_path\" enable --now \"\$index_timer\"" "$automation"
+grep -Fq "boxup-backup-desktop@\$profile.timer" "$automation"
+grep -Fq "boxup-backup-server@\$profile.timer" "$automation"
+grep -Fq "boxup-index@\$profile.timer" "$automation"
 if grep -Eq 'boxup-(maintenance|check)@' "$automation"; then
   printf '%s\n' 'Automation helper may not manage maintenance or check units.' >&2
   exit 1

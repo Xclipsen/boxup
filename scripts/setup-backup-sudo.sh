@@ -42,15 +42,15 @@ config="/etc/boxup/$profile.toml"
 /usr/lib/boxup/boxup-root --config "$config" validate-config
 
 sudoers_dir=/etc/sudoers.d
-[ -d "$sudoers_dir" ] && [ ! -L "$sudoers_dir" ] || {
+if [ ! -d "$sudoers_dir" ] || [ -L "$sudoers_dir" ]; then
   printf '%s\n' '/etc/sudoers.d must be an existing non-symlink directory.' >&2
   exit 1
-}
-[ "$(stat -c %u "$sudoers_dir")" -eq 0 ] && \
-  [ $((0$(stat -c %a "$sudoers_dir") & 0022)) -eq 0 ] || {
+fi
+if [ "$(stat -c %u "$sudoers_dir")" -ne 0 ] || \
+   [ $((0$(stat -c %a "$sudoers_dir") & 0022)) -ne 0 ]; then
   printf '%s\n' '/etc/sudoers.d must be root-owned and not group/other writable.' >&2
   exit 1
-}
+fi
 
 visudo=
 for candidate in /usr/sbin/visudo /usr/bin/visudo; do

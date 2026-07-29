@@ -337,8 +337,9 @@ impl<'a, B: Backend + ?Sized> JobRunner<'a, B> {
                         }
                     }
                 };
-                if progress_receiver.has_changed().unwrap_or(false) {
-                    reporter.report_create(*progress_receiver.borrow_and_update());
+                let final_progress = *progress_receiver.borrow_and_update();
+                if stats_received || final_progress != CreateProgress::default() {
+                    reporter.report_create(final_progress);
                     stats_received = true;
                 }
                 if stats_received {
@@ -1424,10 +1425,10 @@ async fn run_command(
 async fn terminate_and_reap(child: &mut Child, pid: Pid) -> Result<()> {
     let mut leader_reaped = child.try_wait()?.is_some();
     if !leader_reaped {
-        if let Err(error) = killpg(pid, Signal::SIGTERM)
-            && error != Errno::ESRCH
-        {
-            return Err(error).context("failed to terminate external process group");
+        if let Err(error) = killpg(pid, Signal::SIGTERM) {
+            if error != Errno::ESRCH {
+                return Err(error).context("failed to terminate external process group");
+            }
         }
         leader_reaped =
             match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
@@ -1438,10 +1439,10 @@ async fn terminate_and_reap(child: &mut Child, pid: Pid) -> Result<()> {
                 Err(_) => false,
             };
     }
-    if let Err(error) = killpg(pid, Signal::SIGKILL)
-        && error != Errno::ESRCH
-    {
-        return Err(error).context("failed to kill remaining external process group");
+    if let Err(error) = killpg(pid, Signal::SIGKILL) {
+        if error != Errno::ESRCH {
+            return Err(error).context("failed to kill remaining external process group");
+        }
     }
     if !leader_reaped {
         child

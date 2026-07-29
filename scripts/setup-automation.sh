@@ -28,11 +28,12 @@ case "$test_marker" in
     script_path=$(realpath -e -- "$0") || fail 'Could not resolve the test helper path.'
     [ "$script_path" != /usr/lib/boxup/setup-automation ] || \
       fail 'Test overrides are disabled for the installed helper.'
-    [ -n "${BOXUP_AUTOMATION_SYSTEMCTL:-}" ] && \
-      [ -n "${BOXUP_AUTOMATION_BOXUP_ROOT:-}" ] && \
-    [ -n "${BOXUP_AUTOMATION_CONFIG_DIR:-}" ] && \
-      [ -n "${BOXUP_AUTOMATION_STATE_ROOT:-}" ] || \
+    if [ -z "${BOXUP_AUTOMATION_SYSTEMCTL:-}" ] || \
+       [ -z "${BOXUP_AUTOMATION_BOXUP_ROOT:-}" ] || \
+       [ -z "${BOXUP_AUTOMATION_CONFIG_DIR:-}" ] || \
+       [ -z "${BOXUP_AUTOMATION_STATE_ROOT:-}" ]; then
       fail 'Test mode requires fixed systemctl, boxup-root, and config paths.'
+    fi
     systemctl_path=$(realpath -e -- "$BOXUP_AUTOMATION_SYSTEMCTL") || \
       fail 'Could not resolve the test systemctl path.'
     boxup_root_path=$(realpath -e -- "$BOXUP_AUTOMATION_BOXUP_ROOT") || \
@@ -41,10 +42,11 @@ case "$test_marker" in
       fail 'Could not resolve the test config directory.'
     state_root=$(realpath -e -- "$BOXUP_AUTOMATION_STATE_ROOT") || \
       fail 'Could not resolve the test state root.'
-    [ "$systemctl_path" != /usr/bin/systemctl ] && \
-      [ "$boxup_root_path" != /usr/lib/boxup/boxup-root ] && \
-      [ "$config_dir" != /etc/boxup ] && [ "$state_root" != /var/lib/boxup ] || \
+    if [ "$systemctl_path" = /usr/bin/systemctl ] || \
+       [ "$boxup_root_path" = /usr/lib/boxup/boxup-root ] || \
+       [ "$config_dir" = /etc/boxup ] || [ "$state_root" = /var/lib/boxup ]; then
       fail 'Test mode may not use installed system paths.'
+    fi
     required_owner=$(id -u)
     ;;
   *) fail 'BOXUP_AUTOMATION_TEST_ONLY must be unset or 1.' ;;
@@ -224,12 +226,12 @@ else
   expected_server_active=false
   expected_index_active=false
 fi
-[ "$desktop_enabled" = "$expected_desktop" ] && \
-  [ "$server_enabled" = "$expected_server" ] && \
-  [ "$index_enabled" = "$expected_index" ] && \
-  [ "$desktop_active" = "$expected_desktop_active" ] && \
-  [ "$server_active" = "$expected_server_active" ] && \
-  [ "$index_active" = "$expected_index_active" ] || {
+if [ "$desktop_enabled" != "$expected_desktop" ] || \
+   [ "$server_enabled" != "$expected_server" ] || \
+   [ "$index_enabled" != "$expected_index" ] || \
+   [ "$desktop_active" != "$expected_desktop_active" ] || \
+   [ "$server_active" != "$expected_server_active" ] || \
+   [ "$index_active" != "$expected_index_active" ]; then
     rollback || fail 'Automation verification failed and rollback was incomplete.'
     fail 'Automation verification failed; previous timer state was restored.'
-  }
+fi
